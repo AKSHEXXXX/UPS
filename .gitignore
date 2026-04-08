@@ -63,11 +63,13 @@ dmypy.json
 
 # macOS
 .DS_Store
+**/.DS_Store
 
 # Local outputs
 outputs/
 log_outputs/
-artifacts/
+artifacts/generated/
+*.log
 
 # Training artifacts (Stable-Baselines3)
 logs/

@@ -20,7 +20,7 @@ from core.models import ColdChainAction, ColdChainObservation, ColdChainState, G
 from core.reward import compute_step_reward
 from core.shipment import CARGO_SPECS, Shipment, update_temperature
 from core.vehicle import RefrigStatus, Vehicle, VehicleStatus, get_hold_temperature, maybe_breakdown, maybe_degrade_refrigeration, step_dock_timer
-from core.weather import WeatherSystem
+from core.weather import WeatherEvent, WeatherSystem
 
 
 class ColdChainEnvironment(Environment):
@@ -41,10 +41,16 @@ class ColdChainEnvironment(Environment):
         self._prev_distances: Dict[tuple[int, int], int] = {}
         self._node_visit_counts: Dict[tuple[int, int], int] = {}
         self._last_known_temps: Dict[int, float] = {}
+        self._transit_no_progress_streak: Dict[int, int] = {}
         self._trajectory: list[tuple[Any, Any, float, Dict[str, Any]]] = []
         self.milestones = {"pickup": False, "departed": False, "halfway": False, "delivered": False}
         self._initial_distances: Dict[int, float] = {}
+        self._last_action_type: Optional[int] = None
+        self._same_action_streak: int = 0
         self.difficulty = 1
+        self._forced_weather_schedule: Dict[int, tuple[WeatherEvent, int]] = {}
+        self._forced_weather_only: bool = False
+        self._forced_breakdown_schedule: Dict[int, List[int]] = {}
 
     def reset(self, seed: Optional[int] = None, episode_id=None, **kwargs) -> ColdChainObservation:
         self._rng = np.random.default_rng(seed if seed is not None else self.config.graph_seed)
@@ -58,19 +64,114 @@ class ColdChainEnvironment(Environment):
         self._prev_distances = {}
         self._node_visit_counts = {}
         self._last_known_temps = {}
+        self._transit_no_progress_streak = {}
         self._trajectory = []
         self.milestones = {"pickup": False, "departed": False, "halfway": False, "delivered": False}
         self._initial_distances = {}
+        self._last_action_type = None
+        self._same_action_streak = 0
+        self._forced_weather_schedule = {}
+        self._forced_weather_only = bool(kwargs.get("forced_weather_only", False))
+        self._forced_breakdown_schedule = {}
 
         self.vehicles = [Vehicle(id=index, location=0) for index in range(self.config.n_vehicles)]
         self.shipments = self._build_shipments()
 
         self._initialize_vehicle_state()
-        
+
+        vehicle_start_nodes = kwargs.get("vehicle_start_nodes") or kwargs.get("vehicle_start_locations")
+        shipment_destinations = kwargs.get("shipment_destinations")
+        shipment_cargo_temps = kwargs.get("shipment_cargo_temps")
+        shipment_cargo_types = kwargs.get("shipment_cargo_types")
+        shipment_priorities = kwargs.get("shipment_priorities")
+        shipment_deadlines = kwargs.get("shipment_deadlines")
+        shipment_assignments = kwargs.get("shipment_assignments")
+        forced_weather_events = kwargs.get("forced_weather_events")
+        forced_breakdowns = kwargs.get("forced_breakdowns")
+        load_shipments_on_start = bool(kwargs.get("load_shipments_on_start", False))
+        custom_layout = any(
+            value is not None
+            for value in (
+                vehicle_start_nodes,
+                shipment_destinations,
+                shipment_cargo_temps,
+                shipment_cargo_types,
+                shipment_priorities,
+                shipment_deadlines,
+                shipment_assignments,
+            )
+        )
+
+        if forced_weather_events:
+            for event in list(forced_weather_events):
+                step = int(event.get("step", 0))
+                duration = int(event.get("duration", 1))
+                event_name = str(event.get("event", "NONE")).upper()
+                if event_name in WeatherEvent.__members__:
+                    self._forced_weather_schedule[step] = (WeatherEvent[event_name], duration)
+
+        if forced_breakdowns:
+            for item in list(forced_breakdowns):
+                step = int(item.get("step", 0))
+                vehicle_ids = [int(vehicle_id) for vehicle_id in item.get("vehicle_ids", [])]
+                self._forced_breakdown_schedule.setdefault(step, []).extend(vehicle_ids)
+
+        if vehicle_start_nodes is not None:
+            for index, node in enumerate(list(vehicle_start_nodes)[: len(self.vehicles)]):
+                self.vehicles[index].location = int(node)
+                self.vehicles[index].visited_nodes_this_route = {int(node)}
+
+        if shipment_destinations is not None:
+            for index, node in enumerate(list(shipment_destinations)[: len(self.shipments)]):
+                self.shipments[index].destination_node = int(node)
+
+        if shipment_cargo_temps is not None:
+            for index, temp in enumerate(list(shipment_cargo_temps)[: len(self.shipments)]):
+                self.shipments[index].cargo_temp = float(temp)
+
+        if shipment_cargo_types is not None:
+            for index, cargo_type in enumerate(list(shipment_cargo_types)[: len(self.shipments)]):
+                if str(cargo_type) in CARGO_SPECS:
+                    bounds = CARGO_SPECS[str(cargo_type)]
+                    shipment = self.shipments[index]
+                    shipment.cargo_type = str(cargo_type)
+                    shipment.temp_lower_bound = float(bounds["low"])
+                    shipment.temp_upper_bound = float(bounds["high"])
+
+        if shipment_priorities is not None:
+            for index, priority in enumerate(list(shipment_priorities)[: len(self.shipments)]):
+                self.shipments[index].priority = int(priority)
+
+        if shipment_deadlines is not None:
+            for index, deadline in enumerate(list(shipment_deadlines)[: len(self.shipments)]):
+                self.shipments[index].deadline_step = int(deadline)
+
+        for shipment in self.shipments:
+            shipment.current_vehicle_id = -1
+
+        for vehicle in self.vehicles:
+            vehicle.shipments_onboard = []
+
+        if shipment_assignments is not None:
+            for shipment_index, vehicle_index in enumerate(list(shipment_assignments)[: len(self.shipments)]):
+                if 0 <= int(vehicle_index) < len(self.vehicles):
+                    vehicle = self.vehicles[int(vehicle_index)]
+                    shipment = self.shipments[shipment_index]
+                    if len(vehicle.shipments_onboard) < self.config.max_cargo_per_vehicle:
+                        vehicle.shipments_onboard.append(shipment.id)
+                        shipment.current_vehicle_id = vehicle.id
+        elif load_shipments_on_start:
+            for shipment_index, shipment in enumerate(self.shipments):
+                if shipment_index < len(self.vehicles):
+                    vehicle = self.vehicles[shipment_index]
+                    if len(vehicle.shipments_onboard) < self.config.max_cargo_per_vehicle:
+                        vehicle.shipments_onboard.append(shipment.id)
+                        shipment.current_vehicle_id = vehicle.id
+
         # Curriculum Learning: Teleport vehicle near destination (Fix 1 in Debug.md)
         self.difficulty = kwargs.get("curriculum_difficulty", 3)
         difficulty = self.difficulty
-        if difficulty < 3:
+        if difficulty < 3 and not custom_layout:
             if self.shipments and self.vehicles:
                 shipment = self.shipments[0]
                 vehicle = self.vehicles[0]
@@ -134,7 +235,26 @@ class ColdChainEnvironment(Environment):
         else:
             self._last_action_was_masked = False
 
-        self.weather.step(self._rng, self.config)
+        current_action_type = int(action_payload.get("action_type", 0))
+        if self._last_action_type is None or current_action_type != self._last_action_type:
+            self._same_action_streak = 1
+        else:
+            self._same_action_streak += 1
+        self._last_action_type = current_action_type
+
+        if self._forced_weather_only:
+            if self.weather.event_duration_remaining > 0:
+                self.weather.event_duration_remaining -= 1
+                if self.weather.event_duration_remaining == 0:
+                    self.weather.current_event = WeatherEvent.NONE
+        else:
+            self.weather.step(self._rng, self.config)
+
+        forced_weather = self._forced_weather_schedule.get(self.steps_elapsed)
+        if forced_weather is not None:
+            event_type, duration = forced_weather
+            self.weather.current_event = event_type
+            self.weather.event_duration_remaining = max(0, int(duration))
         refresh_edge_weights(self.graph, self.weather.traffic_multiplier)
         self._execute_action(action_payload)
         self._advance_vehicles()
@@ -149,9 +269,13 @@ class ColdChainEnvironment(Environment):
             vehicles=self.vehicles,
             graph=self.graph,
             steps_elapsed=self.steps_elapsed,
+            _prev_distances=self._prev_distances,
             node_visit_counts=self._node_visit_counts,
             milestones=self.milestones,
             _initial_distances=self._initial_distances,
+            transit_no_progress_streak=self._transit_no_progress_streak,
+            action_type=current_action_type,
+            action_repeat_count=self._same_action_streak,
         )
         reward, breakdown = compute_step_reward(env_state, action_payload, self._prev_distances, self.config)
         info["reward_breakdown"] = breakdown
@@ -162,17 +286,25 @@ class ColdChainEnvironment(Environment):
         self._state.steps_remaining = max(0, self.config.max_steps - self.steps_elapsed)
         self._state.illegal_action_count = self._illegal_action_count
 
-        terminated = self._all_shipments_complete()
-        truncated = self.steps_elapsed >= self.config.max_steps
+        all_delivered = self._all_shipments_delivered()
+        all_destroyed = self._all_shipments_destroyed()
+        terminated = all_delivered
+        truncated = (self.steps_elapsed >= self.config.max_steps) or all_destroyed
         self._episode_done = terminated or truncated
         self._state.terminated = terminated
         self._state.truncated = truncated
 
-        # Fix 1: Terminal non-delivery penalty — makes "hiding at depot" a losing strategy
+        if all_destroyed and not all_delivered:
+            # Hard-stop failure mode: do not allow "destroy fast" to be a viable shortcut.
+            reward += -30.0 * float(len(self.shipments))
+            info["all_destroyed_terminal_penalty"] = -30.0 * float(len(self.shipments))
+
+        # Terminal non-delivery penalty — scaled to avoid drowning dense learning signal.
         if truncated and not terminated:
             undelivered = [s for s in self.shipments if not s.is_delivered and not s.is_destroyed]
             if undelivered:
-                terminal_penalty = -200.0 * len(undelivered)
+                # Terminal penalties never anneal: timeout must remain a hard failure.
+                terminal_penalty = -5.0 * len(undelivered)
                 reward += terminal_penalty
                 info["terminal_penalty"] = terminal_penalty
 
@@ -259,8 +391,11 @@ class ColdChainEnvironment(Environment):
     def _advance_vehicles(self) -> None:
         assert self.graph is not None
         depot_nodes = list(self.graph.graph.get("cold_depot_nodes", []))
+        forced_breakdowns = set(self._forced_breakdown_schedule.get(self.steps_elapsed, []))
         for vehicle in self.vehicles:
             maybe_degrade_refrigeration(vehicle, self._rng, self.config)
+            if vehicle.id in forced_breakdowns:
+                vehicle.status = VehicleStatus.BROKEN
             maybe_breakdown(vehicle, self._rng, self.config)
 
             if vehicle.status == VehicleStatus.BROKEN:
@@ -274,12 +409,20 @@ class ColdChainEnvironment(Environment):
                 if vehicle.steps_until_next_waypoint > 0:
                     vehicle.steps_until_next_waypoint -= 1
                     vehicle.steps_at_current_location = 0
-                
+                    if vehicle.steps_until_next_waypoint > 0:
+                        continue
+
                 if vehicle.steps_until_next_waypoint <= 0 and vehicle.route:
                     vehicle.location = int(vehicle.route.pop(0))
                     vehicle.visited_nodes_this_route.add(vehicle.location)
                     vehicle.steps_at_current_location = 0
-                    if vehicle.location in depot_nodes:
+                    if vehicle.route:
+                        next_node = int(vehicle.route[0])
+                        vehicle.steps_until_next_waypoint = int(
+                            nx.shortest_path_length(self.graph, vehicle.location, next_node, weight="current_weight")
+                        )
+                        vehicle.status = VehicleStatus.IN_TRANSIT
+                    elif vehicle.location in depot_nodes:
                         vehicle.status = VehicleStatus.AT_STOP
                         vehicle.dock_steps_remaining = 2
                         vehicle.hold_temp = 4.0
@@ -312,15 +455,23 @@ class ColdChainEnvironment(Environment):
             return
         if action_type == 1:
             if target_index != vehicle.location:
-                vehicle.route = [target_index]
-                vehicle.steps_until_next_waypoint = int(nx.shortest_path_length(self.graph, vehicle.location, target_index, weight="current_weight"))
+                path = nx.shortest_path(self.graph, vehicle.location, target_index, weight="current_weight")
+                vehicle.route = [int(node) for node in path[1:]]
+                if vehicle.route:
+                    vehicle.steps_until_next_waypoint = int(
+                        nx.shortest_path_length(self.graph, vehicle.location, vehicle.route[0], weight="current_weight")
+                    )
                 vehicle.status = VehicleStatus.IN_TRANSIT
                 vehicle.visited_nodes_this_route = {vehicle.location}
                 vehicle.fuel_level = max(0.0, vehicle.fuel_level - 0.01)
         elif action_type == 2:
             if target_index in self.graph.graph.get("cold_depot_nodes", []):
-                vehicle.route = [target_index]
-                vehicle.steps_until_next_waypoint = int(nx.shortest_path_length(self.graph, vehicle.location, target_index, weight="current_weight"))
+                path = nx.shortest_path(self.graph, vehicle.location, target_index, weight="current_weight")
+                vehicle.route = [int(node) for node in path[1:]]
+                if vehicle.route:
+                    vehicle.steps_until_next_waypoint = int(
+                        nx.shortest_path_length(self.graph, vehicle.location, vehicle.route[0], weight="current_weight")
+                    )
                 vehicle.status = VehicleStatus.IN_TRANSIT
                 vehicle.visited_nodes_this_route = {vehicle.location}
                 vehicle.fuel_level = max(0.0, vehicle.fuel_level - 0.03)
@@ -346,8 +497,12 @@ class ColdChainEnvironment(Environment):
                 for shipment_id in list(vehicle.shipments_onboard):
                     self.shipments[shipment_id].current_vehicle_id = -1
                     vehicle.shipments_onboard.remove(shipment_id)
-                vehicle.route = [0]
-                vehicle.steps_until_next_waypoint = int(nx.shortest_path_length(self.graph, vehicle.location, 0, weight="current_weight"))
+                path = nx.shortest_path(self.graph, vehicle.location, 0, weight="current_weight")
+                vehicle.route = [int(node) for node in path[1:]]
+                if vehicle.route:
+                    vehicle.steps_until_next_waypoint = int(
+                        nx.shortest_path_length(self.graph, vehicle.location, vehicle.route[0], weight="current_weight")
+                    )
                 vehicle.status = VehicleStatus.IN_TRANSIT
                 vehicle.visited_nodes_this_route = {vehicle.location}
                 vehicle.fuel_level = max(0.0, vehicle.fuel_level - 0.2)
@@ -488,9 +643,32 @@ class ColdChainEnvironment(Environment):
         )
 
     def _get_info(self):
+        all_delivered = all(shipment.is_delivered for shipment in self.shipments)
+        all_destroyed = all(shipment.is_destroyed for shipment in self.shipments)
+        any_delivered = any(shipment.is_delivered for shipment in self.shipments)
+        termination_reason = "in_progress"
+        if self._state.terminated:
+            if all_delivered:
+                termination_reason = "all_delivered"
+            elif self._all_shipments_complete():
+                termination_reason = "mixed_complete"
+            else:
+                termination_reason = "terminated_unknown"
+        elif self._state.truncated:
+            if all_destroyed:
+                termination_reason = "all_destroyed"
+            else:
+                termination_reason = "max_steps"
+
         info = {
             "action_was_masked": self._last_action_was_masked,
             "illegal_action_count": self._illegal_action_count,
+            "last_action_type": self._last_action_type,
+            "same_action_streak": self._same_action_streak,
+            "transit_no_progress_streak": dict(self._transit_no_progress_streak),
+            "delivery_success": bool(all_delivered),
+            "delivery_any": bool(any_delivered),
+            "termination_reason": termination_reason,
             "per_shipment_status": {shipment.id: dataclasses.asdict(shipment) for shipment in self.shipments},
             "per_vehicle_status": {vehicle.id: dataclasses.asdict(vehicle) for vehicle in self.vehicles},
         }
@@ -511,6 +689,12 @@ class ColdChainEnvironment(Environment):
 
     def _all_shipments_complete(self) -> bool:
         return all(shipment.is_delivered or shipment.is_destroyed for shipment in self.shipments)
+
+    def _all_shipments_delivered(self) -> bool:
+        return all(shipment.is_delivered for shipment in self.shipments)
+
+    def _all_shipments_destroyed(self) -> bool:
+        return all(shipment.is_destroyed for shipment in self.shipments)
 
     def _build_episode_summary(self) -> Dict[str, Any]:
         return {

@@ -14,6 +14,7 @@ class CurriculumWrapper(gym.Wrapper):
         super().__init__(env)
         self.difficulty = 1  
         self.success_count = 0
+        self.successes_to_advance = 2
 
     def reset(self, seed=None, options=None):
         if self.difficulty < 3:
@@ -26,15 +27,16 @@ class CurriculumWrapper(gym.Wrapper):
     def step(self, action):
         obs, reward, terminated, truncated, info = self.env.step(action)
         
-        # If successfully delivered, progress curriculum
-        if (terminated or truncated) and any(s.is_delivered for s in self.env.unwrapped.shipments):
+        # Progress curriculum only on successful terminal delivery outcomes.
+        if terminated and bool(info.get("delivery_success", False)):
             self.success_count += 1
-            print(f"DEBUG: Success count = {self.success_count}/5 for Difficulty {self.difficulty}")
-            if self.success_count >= 5: # Level up after 5 successes
+            print(f"DEBUG: Success count = {self.success_count}/{self.successes_to_advance} for Difficulty {self.difficulty}")
+            if self.success_count >= self.successes_to_advance:
                 if self.difficulty < 3:
+                    old_diff = self.difficulty
                     self.difficulty += 1
                     self.success_count = 0
-                    print(f"🎓 CURRICULUM GRADUATED to Level {self.difficulty}")
+                    print(f"🎓 Curriculum graduated: difficulty {old_diff} -> {self.difficulty}")
                 
         return obs, reward, terminated, truncated, info
 
@@ -136,7 +138,15 @@ class ColdChainEnv(gym.Env):
         return self._convert_observation(observation), info
 
     def step(self, action):
-        a = int(action)
+        if isinstance(action, (list, tuple, np.ndarray)):
+            if len(action) != 3:
+                raise ValueError("Structured action must contain [vehicle_index, action_type, target_index]")
+            vehicle_index = int(action[0])
+            action_type = int(action[1])
+            target_index = int(action[2])
+            a = vehicle_index * (6 * self.config.n_nodes) + action_type * self.config.n_nodes + target_index
+        else:
+            a = int(action)
         
         # Decode action
         n_nodes = self.config.n_nodes
