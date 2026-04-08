@@ -46,6 +46,10 @@ RUN --mount=type=cache,target=/root/.cache/uv \
         uv sync --no-editable; \
     fi
 
+# Install the FastAPI runtime into the project virtualenv explicitly.
+# Hugging Face/OpenEnv startup should not fall back to binaries from the base image.
+RUN /app/env/.venv/bin/pip install --no-cache-dir -r /app/env/server/requirements.txt
+
 # Final runtime stage
 FROM ${BASE_IMAGE}
 
@@ -68,5 +72,6 @@ ENV PYTHONPATH="/app/env:/app/env/algorithms:/app/env/evaluation:/app/env/grader
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=2)" || exit 1
 
-# Run the FastAPI server from the repository root inside the container.
-CMD ["sh", "-c", "cd /app/env && uvicorn server.app:app --host 0.0.0.0 --port 8000"]
+# Run the FastAPI server with the project virtualenv interpreter so runtime
+# imports resolve from /app/.venv instead of any binaries bundled in the base image.
+CMD ["sh", "-c", "cd /app/env && /app/.venv/bin/python -m uvicorn server.app:app --host 0.0.0.0 --port 8000"]
