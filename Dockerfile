@@ -15,9 +15,9 @@ FROM ${BASE_IMAGE} AS builder
 
 WORKDIR /app
 
-# Ensure git is available (required for installing dependencies from VCS)
+# Ensure tools are available (git for VCS dependencies, curl for optional uv bootstrap)
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends git && \
+    apt-get install -y --no-install-recommends git curl && \
     rm -rf /var/lib/apt/lists/*
 
 # Build argument to control whether we're building standalone or in-repo
@@ -38,15 +38,7 @@ RUN if ! command -v uv >/dev/null 2>&1; then \
         mv /root/.local/bin/uvx /usr/local/bin/uvx; \
     fi
     
-# Install dependencies using uv sync
-# If uv.lock exists, use it; otherwise resolve on the fly
-RUN --mount=type=cache,target=/root/.cache/uv \
-    if [ -f uv.lock ]; then \
-        uv sync --frozen --no-install-project --no-editable; \
-    else \
-        uv sync --no-install-project --no-editable; \
-    fi
-
+# Install dependencies (and the project itself) in one sync pass.
 RUN --mount=type=cache,target=/root/.cache/uv \
     if [ -f uv.lock ]; then \
         uv sync --frozen --no-editable; \
@@ -62,19 +54,19 @@ WORKDIR /app
 # Copy the virtual environment from builder
 COPY --from=builder /app/env/.venv /app/.venv
 
-# Copy the environment code
-COPY --from=builder /app/env /app/env
+# Copy source code from build context (lightweight via .dockerignore).
+# This avoids re-copying builder's .venv a second time.
+COPY . /app/env
 
 # Set PATH to use the virtual environment
 ENV PATH="/app/.venv/bin:$PATH"
 
-# Set PYTHONPATH so imports work correctly
-ENV PYTHONPATH="/app/env:$PYTHONPATH"
+# Set PYTHONPATH so imports from reorganized folders are always resolvable.
+ENV PYTHONPATH="/app/env:/app/env/algorithms:/app/env/evaluation:/app/env/graders:$PYTHONPATH"
 
-# Health check
+# Health check using Python stdlib to avoid runtime curl dependency.
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:8000/health || exit 1
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=2)" || exit 1
 
-# Run the FastAPI server
-# The module path is constructed to work with the /app/env structure
+# Run the FastAPI server from the repository root inside the container.
 CMD ["sh", "-c", "cd /app/env && uvicorn server.app:app --host 0.0.0.0 --port 8000"]
