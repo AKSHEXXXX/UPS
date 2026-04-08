@@ -28,6 +28,8 @@
 set -uo pipefail
 
 DOCKER_BUILD_TIMEOUT=600
+PING_RETRIES=6
+PING_RETRY_DELAY=8
 if [ -t 1 ]; then
   RED='\033[0;31m'
   GREEN='\033[0;32m'
@@ -69,6 +71,18 @@ trap cleanup EXIT
 PING_URL="${1:-}"
 REPO_DIR="${2:-.}"
 
+normalize_ping_url() {
+  local input="$1"
+  input="${input%/}"
+  if [[ "$input" =~ ^https?://huggingface\.co/spaces/([^/]+)/([^/]+)$ ]]; then
+    local owner="${BASH_REMATCH[1]}"
+    local space="${BASH_REMATCH[2]}"
+    printf "https://%s-%s.hf.space" "$owner" "$space"
+    return
+  fi
+  printf "%s" "$input"
+}
+
 if [ -z "$PING_URL" ]; then
   printf "Usage: %s <ping_url> [repo_dir]\n" "$0"
   printf "\n"
@@ -81,7 +95,7 @@ if ! REPO_DIR="$(cd "$REPO_DIR" 2>/dev/null && pwd)"; then
   printf "Error: directory '%s' not found\n" "${2:-.}"
   exit 1
 fi
-PING_URL="${PING_URL%/}"
+PING_URL="$(normalize_ping_url "$PING_URL")"
 export PING_URL
 PASS=0
 
@@ -106,9 +120,25 @@ log "${BOLD}Step 1/3: Pinging HF Space${NC} ($PING_URL/reset) ..."
 
 CURL_OUTPUT=$(portable_mktemp "validate-curl")
 CLEANUP_FILES+=("$CURL_OUTPUT")
-HTTP_CODE=$(curl -s -o "$CURL_OUTPUT" -w "%{http_code}" -X POST \
-  -H "Content-Type: application/json" -d '{}' \
-  "$PING_URL/reset" --max-time 30 2>"$CURL_OUTPUT" || printf "000")
+HTTP_CODE="000"
+for attempt in $(seq 1 "$PING_RETRIES"); do
+  HTTP_CODE=$(curl -s -o "$CURL_OUTPUT" -w "%{http_code}" -X POST \
+    -H "Content-Type: application/json" -d '{}' \
+    "$PING_URL/reset" --max-time 30 2>"$CURL_OUTPUT" || printf "000")
+
+  if [ "$HTTP_CODE" = "200" ]; then
+    break
+  fi
+
+  if [ "$HTTP_CODE" = "502" ] || [ "$HTTP_CODE" = "503" ] || [ "$HTTP_CODE" = "504" ] || [ "$HTTP_CODE" = "429" ] || [ "$HTTP_CODE" = "000" ]; then
+    if [ "$attempt" -lt "$PING_RETRIES" ]; then
+      log "  retry ${attempt}/${PING_RETRIES} (HTTP ${HTTP_CODE}) after ${PING_RETRY_DELAY}s"
+      sleep "$PING_RETRY_DELAY"
+      continue
+    fi
+  fi
+  break
+done
 
 if [ "$HTTP_CODE" = "200" ]; then
   pass "HF Space is live and responds to /reset"
