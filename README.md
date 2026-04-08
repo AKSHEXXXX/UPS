@@ -83,7 +83,7 @@ Latest reference snapshot (`seed=42`, `eval_training_step=50000`):
 - `graders/`: tiered grading CLI.
 - `core/`: simulation, reward, graph, shipment, vehicle, and grader internals.
 - `server/`: FastAPI/OpenEnv serving layer and Gym wrapper.
-- `Scripts/`: utility scripts (`Prevalidation.py`, `inference_repro.py`).
+- `Scripts/`: utility scripts (`Prevalidation.py`).
 - `tests/`: unit/integration/regression tests.
 - `models/`: checkpoints used for training and inference.
 
@@ -124,7 +124,7 @@ python graders/basic_grader_eval.py \
 ### 3) Reproducible inference report
 
 ```bash
-python Scripts/inference_repro.py \
+python inference.py \
   --model-path models/ppo_phase3.zip \
   --seeds 42,101,202,303,404 \
   --eval-training-step 50000 \
