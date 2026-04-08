@@ -6,98 +6,167 @@ sdk: docker
 pinned: false
 ---
 
-# UPS
+# UPS ColdChain-Gym
 
-The UPS models pharmaceutical cold-chain logistics where an RL agent dispatches refrigerated vehicles under weather, traffic, and equipment uncertainty.
+UPS ColdChain-Gym is a reinforcement learning environment for pharmaceutical cold-chain delivery. The agent controls refrigerated vehicle actions under uncertain traffic, weather shocks, equipment faults, and delivery deadlines.
 
-## What This Project Solves
+This project is designed for reproducible evaluation and deployment-ready submission workflows (OpenEnv + Hugging Face Space).
 
-- Route perishable cargo with dynamic constraints.
-- Balance delivery success, thermal integrity, and operational efficiency.
-- Stress-test policies with deterministic hazard injection (forced weather and forced breakdown schedules).
+## Problem Statement
 
-## Repository Layout
+Pharma cargo quality depends on both route decisions and thermal safety. A high-performing policy must:
 
-- `algorithms/`: RL training scripts (`ppo_training.py`) and related algorithm entrypoints.
-- `evaluation/`: evaluation contract and shared evaluation utilities (`eval_contract.py`).
-- `graders/`: grader execution scripts (`basic_grader_eval.py`).
-- `core/`: simulation logic (config, graph, reward, shipment/vehicle/weather systems, grader internals).
-- `server/`: OpenEnv/FastAPI adapters and Gymnasium wrapper.
-- `tests/`: unit/integration/regression tests.
-- `artifacts/visualizations/`: generated plots and debugging visuals.
+- Deliver shipments on time.
+- Keep cargo within temperature bounds.
+- Recover from disruptions (weather, breakdowns).
+- Avoid short-horizon exploits that inflate reward but fail delivery objectives.
 
-Canonical entrypoints are organized by folder and should be run directly from those paths.
+## Environment Description
 
-## Action and Observation Interfaces
+Each episode simulates a city graph with a hub, cold depots, vehicles, and shipments.
 
-Action space is flattened discrete control over vehicle, action type, and node target.
+- Graph: weighted network with dynamic edge weights (traffic/weather effects).
+- Fleet: refrigerated vehicles with fuel, route state, and cooling status.
+- Cargo: heterogeneous shipment types (vaccine, insulin, blood, organ) with strict thermal constraints.
+- Events: stochastic and forced disruptions (weather and breakdown schedules).
 
-- Action tuple semantics: `[vehicle_index, action_type, target_index]`
-- Action types:
-  - `0`: WAIT
-  - `1`: REROUTE
-  - `2`: DIVERT_COLD_DEPOT
-  - `3`: SWAP_VEHICLE
-  - `4`: EXPEDITE
-  - `5`: ABORT
+The environment supports curriculum difficulty and deterministic stress testing for robust policy grading.
 
-Observations are dictionary-based tensors with fixed shapes (global features, per-vehicle state, per-shipment state), flattened where needed for PPO pipelines.
+## Action Space
 
-## Current Model and Grading Behavior
+Action space is a flattened discrete index:
 
-Latest graded snapshot (deterministic, `seed=42`, `eval_training_step=50000`):
+- `Discrete((n_vehicles + 1) * 6 * n_nodes)`
 
-- Easy: `0.9974` (PASS, threshold `0.80`)
-- Moderate: `0.8899` (PASS, threshold `0.65`)
-- Hard: `0.5369` (PASS, threshold `0.50`)
-- Extreme: `0.4182` (PASS, threshold `0.35`)
+Flattened action decodes to:
+
+- `[vehicle_index, action_type, target_index]`
+
+Action types:
+
+1. `0` WAIT
+2. `1` REROUTE
+3. `2` DIVERT_COLD_DEPOT
+4. `3` SWAP_VEHICLE
+5. `4` EXPEDITE
+6. `5` ABORT
+
+Invalid actions are masked through `MaskablePPO` action masks.
+
+## Observation Space
+
+Observation is dictionary-based and flattened for PPO training:
+
+- `global`: shape `(7,)`
+- `vehicles`: shape `(n_vehicles, 9 + max_cargo_per_vehicle)`
+- `shipments`: shape `(max_shipments, 13)`
+
+Global features include ambient temperature, traffic/weather signals, and episode progress.
+
+## Grading and Current Baseline
+
+Tiered deterministic grading (`easy`, `moderate`, `hard`, `extreme`) combines delivery ratio, thermal integrity, efficiency, speed, and triage robustness.
+
+Latest reference snapshot (`seed=42`, `eval_training_step=50000`):
+
+- Easy: `0.9974` (PASS)
+- Moderate: `0.8899` (PASS)
+- Hard: `0.5369` (PASS)
+- Extreme: `0.4182` (PASS)
 - Overall completed-tier score: `0.7106`
 
-Recent environment and evaluator updates include:
+## Project Structure
 
-- Deterministic forced weather/breakdown injection for adversarial validation.
-- Tiered Easy/Moderate/Hard/Extreme evaluation with threshold and cap rules.
-- Delivery-focused diagnostics and exploit checks integrated into training workflow.
+- `algorithms/`: PPO training entrypoints and callbacks.
+- `evaluation/`: evaluation contract and deterministic rollout helpers.
+- `graders/`: tiered grading CLI.
+- `core/`: simulation, reward, graph, shipment, vehicle, and grader internals.
+- `server/`: FastAPI/OpenEnv serving layer and Gym wrapper.
+- `Scripts/`: utility scripts (`Prevalidation.py`, `inference_repro.py`).
+- `tests/`: unit/integration/regression tests.
+- `models/`: checkpoints used for training and inference.
 
 ## Setup
 
-```bash
-pip install -e .
-```
-
-Or with uv:
+### Option A: uv (recommended)
 
 ```bash
 uv sync
 ```
 
-## Run Commands
+### Option B: pip
 
-Train PPO phase:
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -e .
+```
+
+## Quick Start
+
+### 1) Train
 
 ```bash
 python algorithms/ppo_training.py --phase 1 --seed 42
 ```
 
-Run grader evaluation:
+### 2) Grade a checkpoint
 
 ```bash
-python graders/basic_grader_eval.py --model-path models/ppo_phase3.zip --seed 42 --eval-training-step 50000 --deterministic
+python graders/basic_grader_eval.py \
+  --model-path models/ppo_phase3.zip \
+  --seed 42 \
+  --eval-training-step 50000 \
+  --deterministic
 ```
 
-Run OpenEnv server:
+### 3) Reproducible inference report
+
+```bash
+python Scripts/inference_repro.py \
+  --model-path models/ppo_phase3.zip \
+  --seeds 42,101,202,303,404 \
+  --eval-training-step 50000 \
+  --output-json outputs/inference_repro.json
+```
+
+This script prints per-seed tier scores, aggregate statistics, and reproducibility digests.
+
+### 4) Run the OpenEnv server
 
 ```bash
 PYTHONPATH=. uvicorn server.app:app --host 0.0.0.0 --port 8000
 ```
 
-Run targeted tests:
+## Validation and Deployment
+
+Local validation:
+
+```bash
+openenv validate . -v
+```
+
+Push to Hugging Face Space:
+
+```bash
+openenv push .
+```
+
+Current public deployment:
+
+- https://huggingface.co/spaces/AKSHEXXXX/coldchain-gym
+
+## Testing
+
+Run targeted smoke tests:
 
 ```bash
 PYTHONPATH=. .venv/bin/pytest tests/test_eval_contract.py tests/test_graders.py -q
 ```
 
-## Notes
+## Hackathon Highlights
 
-- Root infra files (`pyproject.toml`, `setup.py`, `Dockerfile`, `openenv.yaml`) remain at root for packaging and container tooling.
-- `plan.md` tracks the implementation timeline and current behavior summary.
+- Robust RL benchmark for safety-critical logistics.
+- Deterministic adversarial grading for repeatable leaderboard-style scoring.
+- End-to-end reproducibility: fixed seeds, deterministic eval contract, JSON reporting.
+- Deployment-ready OpenEnv package with web interface support.
