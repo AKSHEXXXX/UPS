@@ -9,10 +9,10 @@ Trains a Proximal Policy Optimization (PPO) agent on ColdChainEnv with:
 - Reward breakdown tracking
 
 Usage:
-    python examples/ppo_training.py
+    python examples/ppo_training_example.py
 
     Or in Google Colab:
-    !python examples/ppo_training.py
+    !python examples/ppo_training_example.py
 """
 
 import argparse

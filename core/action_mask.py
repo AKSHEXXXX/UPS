@@ -21,7 +21,10 @@ def compute_action_mask(vehicles: List[Vehicle], shipments: List[Shipment], grap
         if vehicle.status == VehicleStatus.BROKEN:
             continue
 
-        # WAIT ignores target_index, only allow target 0 to prevent bias.
+        active_shipments = any(not s.is_delivered and not s.is_destroyed for s in shipments)
+
+        # WAIT is always legal as the safe fallback action.
+        # Stalling is discouraged by reward shaping, not by hard masking.
         mask[base + 0 * config.n_nodes] = 1
         if vehicle_index == 0:
              # print(f"DEBUG: Vehicle 0 shipments: {vehicle.shipments_onboard}")
@@ -32,15 +35,48 @@ def compute_action_mask(vehicles: List[Vehicle], shipments: List[Shipment], grap
         is_in_transit = vehicle.status == VehicleStatus.IN_TRANSIT and vehicle.steps_until_next_waypoint > 0
 
         if not is_in_transit:
-            for node in range(config.n_nodes):
-                if node != vehicle.location:
-                    mask[base + 1 * config.n_nodes + node] = 1
+            onboard_destinations = set()
+            for shipment_id in vehicle.shipments_onboard:
+                if shipment_id >= len(shipments):
+                    continue
+                shipment = shipments[shipment_id]
+                if shipment.is_delivered or shipment.is_destroyed:
+                    continue
+                onboard_destinations.add(int(shipment.destination_node))
+
+            # Cargo-aware routing: when carrying active shipments, route directly to
+            # known destinations to reduce random target exploration early in training.
+            if onboard_destinations:
+                for node in onboard_destinations:
+                    if node != vehicle.location:
+                        mask[base + 1 * config.n_nodes + node] = 1
+            else:
+                for node in range(config.n_nodes):
+                    if node != vehicle.location:
+                        mask[base + 1 * config.n_nodes + node] = 1
 
         if difficulty >= 2:
             # DIVERT: only legal if NOT already standing at a cold depot.
             # Prevents the "depot-hop" exploit where the agent repeatedly
             # re-issues DIVERT to reset the stall counter.
-            if vehicle.location not in cold_depots:
+            # Also disallow while in transit to prevent route-reset thrashing,
+            # and require onboard cargo so empty vehicles cannot farm safe detours.
+            has_cargo = len(vehicle.shipments_onboard) > 0
+            thermal_risk = False
+            for shipment_id in vehicle.shipments_onboard:
+                if shipment_id >= len(shipments):
+                    continue
+                shipment = shipments[shipment_id]
+                out_of_range = shipment.cargo_temp < shipment.temp_lower_bound or shipment.cargo_temp > shipment.temp_upper_bound
+                near_band_edge = (
+                    (shipment.cargo_temp - shipment.temp_lower_bound) < 1.0
+                    or (shipment.temp_upper_bound - shipment.cargo_temp) < 1.0
+                )
+                if out_of_range or shipment.excursion_count > 0 or near_band_edge:
+                    thermal_risk = True
+                    break
+
+            if vehicle.location not in cold_depots and not is_in_transit and has_cargo and thermal_risk:
                 for depot_node in cold_depots:
                     mask[base + 2 * config.n_nodes + depot_node] = 1
 
@@ -61,8 +97,18 @@ def compute_action_mask(vehicles: List[Vehicle], shipments: List[Shipment], grap
                 mask[base + 4 * config.n_nodes] = 1
 
         if len(vehicle.shipments_onboard) > 0 and difficulty >= 3:
-            # ABORT only at Difficulty 3.
-            mask[base + 5 * config.n_nodes] = 1
+            # ABORT is emergency-only: enable when thermal risk is already present.
+            abort_emergency = False
+            for shipment_id in vehicle.shipments_onboard:
+                if shipment_id >= len(shipments):
+                    continue
+                shipment = shipments[shipment_id]
+                out_of_range = shipment.cargo_temp < shipment.temp_lower_bound or shipment.cargo_temp > shipment.temp_upper_bound
+                if out_of_range or shipment.excursion_count > 0:
+                    abort_emergency = True
+                    break
+            if abort_emergency:
+                mask[base + 5 * config.n_nodes] = 1
 
         row_start = base
         row_end = base + 6 * config.n_nodes
@@ -70,14 +116,9 @@ def compute_action_mask(vehicles: List[Vehicle], shipments: List[Shipment], grap
             mask[base + 0 * config.n_nodes] = 1
 
     global_base = config.n_vehicles * 6 * config.n_nodes
-    # Global no-op also ignores target_index, only allow target 0.
-    mask[global_base + 0 * config.n_nodes] = 1
     active_shipments = any(not shipment.is_delivered and not shipment.is_destroyed for shipment in shipments)
-    # Keep no-op only when no active work remains.
-    if not active_shipments:
-        for vehicle_index, vehicle in enumerate(vehicles):
-            if vehicle.status != VehicleStatus.BROKEN:
-                mask[vehicle_index * 6 * config.n_nodes + 0 * config.n_nodes : vehicle_index * 6 * config.n_nodes + 1 * config.n_nodes] = 1
+    # Global no-op stays legal as a safe fallback action.
+    mask[global_base + 0 * config.n_nodes] = 1
     return mask
 
 

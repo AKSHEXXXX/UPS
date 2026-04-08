@@ -1,124 +1,95 @@
-# ColdChain Gym (OpenEnv + Gymnasium)
+# UPS
 
-## Environment Description and Motivation
+The UPS models pharmaceutical cold-chain logistics where an RL agent dispatches refrigerated vehicles under weather, traffic, and equipment uncertainty.
 
-ColdChain Gym models pharmaceutical cold-chain logistics where an RL agent dispatches refrigerated vehicles under uncertainty. The objective is to maximize successful deliveries while maintaining thermal integrity and controlling operational cost.
+## What This Project Solves
 
-Why this environment matters:
-- Real-world inspired constraints: refrigeration degradation, weather/traffic shifts, depot detours.
-- Safety-critical decisions: late or thermally compromised cargo can be destroyed.
-- Multi-objective RL benchmark: delivery performance, temperature safety, and efficiency must all be balanced.
+- Route perishable cargo with dynamic constraints.
+- Balance delivery success, thermal integrity, and operational efficiency.
+- Stress-test policies with deterministic hazard injection (forced weather and forced breakdown schedules).
 
-The project supports two runtime modes:
-- OpenEnv server/client mode for hackathon-style API usage.
-- Gymnasium wrapper mode for local RL algorithm training and evaluation.
+## Repository Layout
 
-## Repository Organization
+- `algorithms/`: RL training scripts (`ppo_training.py`) and related algorithm entrypoints.
+- `evaluation/`: evaluation contract and shared evaluation utilities (`eval_contract.py`).
+- `graders/`: grader execution scripts (`basic_grader_eval.py`).
+- `core/`: simulation logic (config, graph, reward, shipment/vehicle/weather systems, grader internals).
+- `server/`: OpenEnv/FastAPI adapters and Gymnasium wrapper.
+- `tests/`: unit/integration/regression tests.
+- `artifacts/visualizations/`: generated plots and debugging visuals.
 
-Code is organized by purpose:
-- `core/`: OpenEnv core simulation modules (models, reward, physics, masking, graders).
-- `server/`: FastAPI/OpenEnv serving layer.
-- `coldchain_gym/`: Gymnasium adapter package used by RL pipelines.
-- `tests/`: API, behavior, and comprehensive environment validation.
+Canonical entrypoints are organized by folder and should be run directly from those paths.
 
-Top-level infra files (`pyproject.toml`, `setup.py`, `openenv.yaml`, `Dockerfile`) remain at repository root intentionally because packaging and OpenEnv tooling expect them there.
+## Action and Observation Interfaces
 
-## Action Space Definition
+Action space is flattened discrete control over vehicle, action type, and node target.
 
-Gymnasium action space:
-- `MultiDiscrete([n_vehicles + 1, 6, n_nodes])`
+- Action tuple semantics: `[vehicle_index, action_type, target_index]`
+- Action types:
+  - `0`: WAIT
+  - `1`: REROUTE
+  - `2`: DIVERT_COLD_DEPOT
+  - `3`: SWAP_VEHICLE
+  - `4`: EXPEDITE
+  - `5`: ABORT
 
-Action tuple format:
-- `[vehicle_index, action_type, target_index]`
+Observations are dictionary-based tensors with fixed shapes (global features, per-vehicle state, per-shipment state), flattened where needed for PPO pipelines.
 
-Action types:
-- `0`: WAIT
-- `1`: REROUTE
-- `2`: DIVERT_COLD_DEPOT
-- `3`: SWAP_VEHICLE
-- `4`: EXPEDITE
-- `5`: ABORT
+## Current Model and Grading Behavior
 
-Action masking:
-- Illegal actions are masked via `env.action_masks()`.
-- If an illegal action is passed, the environment forces WAIT and logs the mask event.
+Latest graded snapshot (deterministic, `seed=42`, `eval_training_step=50000`):
 
-## Observation Space Definition
+- Easy: `0.9974` (PASS, threshold `0.80`)
+- Moderate: `0.8899` (PASS, threshold `0.65`)
+- Hard: `0.5369` (PASS, threshold `0.50`)
+- Extreme: `0.4182` (PASS, threshold `0.35`)
+- Overall completed-tier score: `0.7106`
 
-Gymnasium observation is a dict with fixed-shape tensors:
-- `global`: telemetry dict
-  - `ambient_temperature`, `time_of_day`, `traffic_multiplier`, `weather_event`, `hub_cold_storage_temp`, `steps_elapsed`, `steps_remaining`
-- `vehicles`: array shape `(n_vehicles, 9 + max_cargo_per_vehicle)`
-  - location/status/refrigeration/fuel/steps-to-waypoint/onboard cargo slots/depot and destination metrics
-- `shipments`: array shape `(max_shipments, 13)`
-  - cargo temperature bounds, deadlines, carrier assignment, destination, priority/type, excursion and delivery state
+Recent environment and evaluator updates include:
 
-The OpenEnv side returns structured typed models; the Gym wrapper converts them into numpy arrays for RL libraries.
+- Deterministic forced weather/breakdown injection for adversarial validation.
+- Tiered Easy/Moderate/Hard/Extreme evaluation with threshold and cap rules.
+- Delivery-focused diagnostics and exploit checks integrated into training workflow.
 
-## Task Descriptions and Expected Difficulty
-
-1. Basic dispatch control
-- Goal: deliver cargo with minimal destruction under standard conditions.
-- Expected difficulty: Easy to Medium.
-
-2. Multi-vehicle coordination under stochastic events
-- Goal: coordinate reroutes, depot diversions, and expedites as weather and refrigeration dynamics evolve.
-- Expected difficulty: Medium to Hard.
-
-3. High-pressure thermal safety and deadline tradeoffs
-- Goal: maintain temperature integrity with limited fuel/time while avoiding costly abort patterns.
-- Expected difficulty: Hard.
-
-## Setup and Usage Instructions
-
-### 1) Install
+## Setup
 
 ```bash
 pip install -e .
 ```
 
-### 2) Run OpenEnv server locally
+Or with uv:
 
 ```bash
-PYTHONPATH=. uvicorn gym.server.app:app --host 0.0.0.0 --port 8000
+uv sync
 ```
 
-### 3) Use Gymnasium wrapper
+## Run Commands
 
-```python
-from core.config import ColdChainConfig
-from server.env import ColdChainEnv
-
-env = ColdChainEnv(config=ColdChainConfig())
-obs, info = env.reset(seed=42)
-obs, reward, terminated, truncated, info = env.step([0, 0, 0])
-```
-
-### 4) Run tests
+Train PPO phase:
 
 ```bash
-PYTHONPATH=. .venv/bin/pytest tests/test_phase11_comprehensive.py tests/test_debug_systems.py -q
+python algorithms/ppo_training.py --phase 1 --seed 42
 ```
 
-## Baseline Scores
+Run grader evaluation:
 
-Baseline scores below were measured on default config over 20 episodes (`seed=0..19`).
+```bash
+python graders/basic_grader_eval.py --model-path models/ppo_phase3.zip --seed 42 --eval-training-step 50000 --deterministic
+```
 
-Policy definitions:
-- `Random legal`: sample uniformly from current legal action mask.
-- `First legal`: deterministic first legal action from current mask.
+Run OpenEnv server:
 
-| Policy | Avg Episode Reward | CompositeGrader | BasicGrader | ModerateGrader | HardGrader |
-|---|---:|---:|---:|---:|---:|
-| Random legal | -141.659 | 0.000 | 0.000 | 0.000 | 0.000 |
-| First legal | -25.200 | 0.200 | 0.000 | 0.000 | 0.200 |
+```bash
+PYTHONPATH=. uvicorn server.app:app --host 0.0.0.0 --port 8000
+```
 
-Interpretation:
-- Naive baselines underperform significantly, leaving clear room for learning-based policies.
-- Hard/Composite scores improve slightly with deterministic legality-only behavior, but remain far from robust dispatch quality.
+Run targeted tests:
 
-## Notes for Judges
+```bash
+PYTHONPATH=. .venv/bin/pytest tests/test_eval_contract.py tests/test_graders.py -q
+```
 
-- Import fallback chains were removed to keep imports explicit and deterministic.
-- GRPO-specific modules/docs were removed for a cleaner, focused submission.
-- The same environment logic is shared across OpenEnv and Gymnasium interfaces.
+## Notes
+
+- Root infra files (`pyproject.toml`, `setup.py`, `Dockerfile`, `openenv.yaml`) remain at root for packaging and container tooling.
+- `plan.md` tracks the implementation timeline and current behavior summary.

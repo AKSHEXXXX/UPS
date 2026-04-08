@@ -14,6 +14,7 @@ class CurriculumWrapper(gym.Wrapper):
         super().__init__(env)
         self.difficulty = 1  
         self.success_count = 0
+        self.successes_to_advance = 2
 
     def reset(self, seed=None, options=None):
         if self.difficulty < 3:
@@ -26,15 +27,16 @@ class CurriculumWrapper(gym.Wrapper):
     def step(self, action):
         obs, reward, terminated, truncated, info = self.env.step(action)
         
-        # If successfully delivered, progress curriculum
-        if (terminated or truncated) and any(s.is_delivered for s in self.env.unwrapped.shipments):
+        # Progress curriculum only on successful terminal delivery outcomes.
+        if terminated and bool(info.get("delivery_success", False)):
             self.success_count += 1
-            print(f"DEBUG: Success count = {self.success_count}/5 for Difficulty {self.difficulty}")
-            if self.success_count >= 5: # Level up after 5 successes
+            print(f"DEBUG: Success count = {self.success_count}/{self.successes_to_advance} for Difficulty {self.difficulty}")
+            if self.success_count >= self.successes_to_advance:
                 if self.difficulty < 3:
+                    old_diff = self.difficulty
                     self.difficulty += 1
                     self.success_count = 0
-                    print(f"🎓 CURRICULUM GRADUATED to Level {self.difficulty}")
+                    print(f"🎓 Curriculum graduated: difficulty {old_diff} -> {self.difficulty}")
                 
         return obs, reward, terminated, truncated, info
 

@@ -47,16 +47,13 @@ def progress_shaping_reward(
                 continue
             current_distance = nx.shortest_path_length(graph, vehicle.location, shipment.destination_node, weight="current_weight")
             previous_distance = prev_distances.get((vehicle.id, shipment.id), current_distance)
-            steps_remaining = max(int(shipment.deadline_step) - int(steps_elapsed), 1)
-            urgency = 1.0 + (float(config.max_steps) / float(steps_remaining)) * 0.5
-            urgency = min(urgency, 4.0)
-
             net_progress = float(previous_distance - current_distance)
             if net_progress > 0.0:
                 vehicle.visited_nodes_this_route.add(vehicle.location)
-                total += 20.0 * net_progress * urgency
+                # Primary directional signal: reward moving closer each step.
+                total += 0.5 * net_progress
             elif net_progress < 0.0:
-                total += 0.03 * net_progress
+                total += 0.5 * net_progress
 
             prev_distances[(vehicle.id, shipment.id)] = int(current_distance)
     return float(total)
@@ -72,7 +69,19 @@ def action_cost_reward(action, vehicle: Vehicle, config: ColdChainConfig) -> flo
     else:
         action_type = int(action[1]) if len(action) > 1 else 0
     if action_type == 0:  # WAIT
-        return 0.0
+        # Keep WAIT legal but make it increasingly expensive when far from destination.
+        # This discourages stalling as a default policy while preserving safety fallback behavior.
+        if vehicle.status == VehicleStatus.IN_TRANSIT:
+            dist_to_dest = float(getattr(vehicle, "steps_to_destination", config.max_steps))
+            distance_scale = min(dist_to_dest / float(max(config.max_steps, 1)), 1.0)
+            if len(vehicle.shipments_onboard) > 0:
+                return -0.15 * (1.0 + 0.5 * distance_scale)
+            return -0.10 * (1.0 + 0.25 * distance_scale)
+        if len(vehicle.shipments_onboard) > 0:
+            dist_to_dest = float(getattr(vehicle, "steps_to_destination", config.max_steps))
+            distance_scale = min(dist_to_dest / float(max(config.max_steps, 1)), 1.0)
+            return -0.20 * (1.0 + distance_scale)
+        return -0.05
     if action_type == 1:  # REROUTE
         return -0.01
     if action_type == 2:  # DIVERT_COLD_DEPOT
@@ -84,8 +93,102 @@ def action_cost_reward(action, vehicle: Vehicle, config: ColdChainConfig) -> flo
     if action_type == 4:  # EXPEDITE
         return -0.08
     if action_type == 5:  # ABORT
-        return -0.20
+        return -0.35
     return 0.0
+
+
+def no_progress_penalty_reward(vehicles: List[Vehicle], shipments: List[Shipment], config: ColdChainConfig) -> float:
+    total = 0.0
+    for vehicle in vehicles:
+        if len(vehicle.shipments_onboard) == 0:
+            continue
+        dist_to_dest = float(getattr(vehicle, "steps_to_destination", config.max_steps))
+        if dist_to_dest > 0:
+            # If cargo is onboard and vehicle lingers, penalize progressively.
+            linger_steps = max(0, int(getattr(vehicle, "steps_at_current_location", 0)) - 2)
+            if linger_steps > 0:
+                total -= min(0.20, 0.01 * linger_steps)
+    return float(total)
+
+
+def repeated_action_penalty(action_type: int, action_repeat_count: int) -> float:
+    # Penalize repeated non-productive patterns while allowing brief repetition.
+    if action_repeat_count <= 2:
+        return 0.0
+    if action_type in (0, 2, 5):
+        return float(-0.02 * min(action_repeat_count - 2, 8))
+    return 0.0
+
+
+def exploration_bonus(action_type: int, action_repeat_count: int) -> float:
+    # Small encouragement for directional actions without overpowering base reward.
+    if action_type in (1, 4) and action_repeat_count <= 2:
+        return 0.01
+    return 0.0
+
+
+def transit_action_reward(action_type: int, vehicle: Vehicle, graph: nx.Graph, shipments: List[Shipment], prev_distances: Dict) -> float:
+    if vehicle.status != VehicleStatus.IN_TRANSIT or not vehicle.shipments_onboard:
+        return 0.0
+
+    best_delta = 0.0
+    for shipment_id in vehicle.shipments_onboard:
+        if shipment_id >= len(shipments):
+            continue
+        shipment = shipments[shipment_id]
+        if shipment.is_delivered or shipment.is_destroyed:
+            continue
+        current_distance = nx.shortest_path_length(graph, vehicle.location, shipment.destination_node, weight="current_weight")
+        previous_distance = prev_distances.get((vehicle.id, shipment.id), current_distance)
+        best_delta = max(best_delta, float(previous_distance - current_distance))
+
+    if action_type in (1, 4):  # REROUTE / EXPEDITE
+        if best_delta > 0:
+            return float(0.3 + 0.2 * min(best_delta, 5.0))
+        return -0.1
+
+    if action_type == 0:  # WAIT
+        if best_delta > 0:
+            return 0.0
+        return -0.2
+
+    return 0.0
+
+
+def transit_stall_penalty(env_state, config: ColdChainConfig) -> float:
+    streaks = getattr(env_state, "transit_no_progress_streak", None)
+    if streaks is None:
+        return 0.0
+
+    total = 0.0
+    for vehicle in env_state.vehicles:
+        if vehicle.status != VehicleStatus.IN_TRANSIT or not vehicle.shipments_onboard:
+            streaks[vehicle.id] = 0
+            continue
+
+        best_delta = 0.0
+        for shipment_id in vehicle.shipments_onboard:
+            if shipment_id >= len(env_state.shipments):
+                continue
+            shipment = env_state.shipments[shipment_id]
+            if shipment.is_delivered or shipment.is_destroyed:
+                continue
+            current_distance = nx.shortest_path_length(env_state.graph, vehicle.location, shipment.destination_node, weight="current_weight")
+            previous_distance = env_state._prev_distances.get((vehicle.id, shipment.id), current_distance)
+            best_delta = max(best_delta, float(previous_distance - current_distance))
+
+        if best_delta > 0:
+            streaks[vehicle.id] = 0
+            continue
+
+        streaks[vehicle.id] = int(streaks.get(vehicle.id, 0)) + 1
+        if streaks[vehicle.id] <= 3:
+            continue
+
+        stall_duration = streaks[vehicle.id] - 3
+        total -= min(1.0, 0.15 * (1.0 + 0.1 * stall_duration))
+
+    return float(total)
 
 
 def idle_penalty_reward(vehicles: List[Vehicle], shipments: List[Shipment], config: ColdChainConfig) -> float:
@@ -175,10 +278,13 @@ def delivery_event_reward(shipment: Shipment, current_step: int, config: ColdCha
 def catastrophe_event_reward(shipment: Shipment, config: ColdChainConfig) -> float:
     if not shipment.is_destroyed:
         return 0.0
-    priority_mult = {0: 1.0, 1: 1.5, 2: 2.5}[shipment.priority]
-    if shipment.cargo_type == "organ" and shipment.excursion_count > 0:
-        return -120.0
-    return float(-40.0 * priority_mult)
+    # Exploit-proof destruction floor: never profitable against milestone sums.
+    return -50.0
+
+
+def destruction_penalty_with_floor(penalty_scale: float, base_penalty: float = 50.0, floor_scale: float = 0.5) -> float:
+    effective_scale = max(float(penalty_scale), float(floor_scale))
+    return float(-base_penalty * effective_scale)
 
 
 def compute_step_reward(env_state, action, prev_distances, config) -> Tuple[float, Dict]:
@@ -201,24 +307,61 @@ def compute_step_reward(env_state, action, prev_distances, config) -> Tuple[floa
     reward_cost = action_cost_reward(action, selected_vehicle, config)
     reward_idle = idle_penalty_reward(env_state.vehicles, env_state.shipments, config)
     reward_idle += depot_stall_penalty(env_state.vehicles, env_state.graph)
+    reward_no_progress = no_progress_penalty_reward(env_state.vehicles, env_state.shipments, config)
     active_shipments = sum(int(not shipment.is_delivered and not shipment.is_destroyed) for shipment in env_state.shipments)
     reward_time_pressure = time_pressure_penalty(env_state.vehicles, env_state.shipments, env_state.steps_elapsed, config.max_steps)
+    action_type = int(getattr(env_state, "action_type", 0))
+    action_repeat_count = int(getattr(env_state, "action_repeat_count", 1))
+    reward_repeat = repeated_action_penalty(action_type, action_repeat_count)
+    reward_explore = exploration_bonus(action_type, action_repeat_count)
+    reward_transit_action = 0.0
+    if len(env_state.vehicles) > 0:
+        reward_transit_action = transit_action_reward(action_type, env_state.vehicles[0], env_state.graph, env_state.shipments, prev_distances)
+    reward_transit_stall = transit_stall_penalty(env_state, config)
 
     reward_delivery_events = 0.0
     reward_catastrophe = 0.0
     reward_milestones = 0.0
 
     # 2. Base components
-    reward = reward_temp + reward_progress + reward_cost + reward_idle + reward_time_pressure
+    reward = (
+        reward_temp
+        + reward_progress
+        + reward_cost
+        + reward_idle
+        + reward_no_progress
+        + reward_time_pressure
+        + reward_repeat
+        + reward_explore
+        + reward_transit_action
+        + reward_transit_stall
+    )
 
     # 3. Dense Milestone Rewards (Fix 3)
-    # Pickup Milestone
-    if any(len(v.shipments_onboard) > 0 for v in env_state.vehicles) and not env_state.milestones["pickup"]:
-        reward_milestones += 20.0
+    # Pickup milestone with commitment gate.
+    commitment_steps = 10
+    has_cargo_onboard = any(len(v.shipments_onboard) > 0 for v in env_state.vehicles)
+    any_destroyed = any(s.is_destroyed for s in env_state.shipments)
+    pickup_start_key = "pickup_hold_start_step"
+    if has_cargo_onboard and env_state.milestones.get(pickup_start_key) is None:
+        env_state.milestones[pickup_start_key] = int(env_state.steps_elapsed)
+    if any_destroyed:
+        env_state.milestones[pickup_start_key] = None
+    pickup_start_step = env_state.milestones.get(pickup_start_key)
+    if (
+        pickup_start_step is not None
+        and not env_state.milestones["pickup"]
+        and int(env_state.steps_elapsed) - int(pickup_start_step) >= commitment_steps
+    ):
+        reward_milestones += 2.0
         env_state.milestones["pickup"] = True
 
-    # Departed Depot Milestone (Vehicle moving away from start)
-    if any(len(v.visited_nodes_this_route) > 2 for v in env_state.vehicles) and not env_state.milestones["departed"]:
+    # Departed depot milestone requires committed pickup first.
+    if (
+        env_state.milestones["pickup"]
+        and any(len(v.visited_nodes_this_route) > 2 for v in env_state.vehicles)
+        and not env_state.milestones["departed"]
+    ):
         reward_milestones += 1.0
         env_state.milestones["departed"] = True
 
@@ -235,7 +378,11 @@ def compute_step_reward(env_state, action, prev_distances, config) -> Tuple[floa
                     env_state._initial_distances[shipment.id] = current_dist
                     initial_dist = current_dist
                 
-                if current_dist < 0.5 * initial_dist and not env_state.milestones["halfway"]:
+                if (
+                    env_state.milestones["pickup"]
+                    and current_dist < 0.5 * initial_dist
+                    and not env_state.milestones["halfway"]
+                ):
                     reward_milestones += 1.5
                     env_state.milestones["halfway"] = True
 
@@ -252,10 +399,8 @@ def compute_step_reward(env_state, action, prev_distances, config) -> Tuple[floa
             env_state.milestones[delivered_key] = True
             
         if shipment.is_destroyed and not env_state.milestones.get(destroyed_key):
-            catastrophe_comp = catastrophe_event_reward(shipment, config)
-            # Apply annealing to catastrophes
-            if catastrophe_comp < 0:
-                catastrophe_comp *= penalty_scale
+            catastrophe_base = catastrophe_event_reward(shipment, config)
+            catastrophe_comp = destruction_penalty_with_floor(penalty_scale, base_penalty=abs(catastrophe_base), floor_scale=0.5)
             reward_catastrophe += catastrophe_comp
             reward += catastrophe_comp
             env_state.milestones[destroyed_key] = True
@@ -265,11 +410,11 @@ def compute_step_reward(env_state, action, prev_distances, config) -> Tuple[floa
     # Final logic for all-delivered or any-destroyed (Milestones)
     # Fix 4: Clip only the running reward BEFORE adding delivery/catastrophe events,
     # so the full +500 delivery bonus always reaches the policy gradient uncapped.
-    reward = float(np.clip(reward, -300.0, 300.0))
+    reward = float(np.clip(reward, -2.0, 2.0))
 
     if all(shipment.is_delivered for shipment in env_state.shipments):
         if not env_state.milestones["delivered"]:
-            reward += 500.0  # Delivery bonus added AFTER clip — always fully visible
+            reward += 20.0  # Delivery bonus added AFTER clip — always fully visible
             env_state.milestones["delivered"] = True
     # NOTE: Continuous catastrophe penalty removed to prevent value function drowning.
     # Individual shipment destruction is already penalized once in delivery_event_reward.
@@ -279,7 +424,12 @@ def compute_step_reward(env_state, action, prev_distances, config) -> Tuple[floa
         "r_progress": reward_progress,
         "r_cost": reward_cost,
         "r_idle": reward_idle,
+        "r_no_progress": reward_no_progress,
         "r_time": reward_time_pressure,
+        "r_repeat": reward_repeat,
+        "r_explore": reward_explore,
+        "r_transit_action": reward_transit_action,
+        "r_transit_stall": reward_transit_stall,
         "r_delivery_events": reward_delivery_events,
         "r_catastrophe": reward_catastrophe,
         "r_milestones": reward_milestones,
