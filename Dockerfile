@@ -37,7 +37,11 @@ RUN if ! command -v uv >/dev/null 2>&1; then \
         mv /root/.local/bin/uv /usr/local/bin/uv && \
         mv /root/.local/bin/uvx /usr/local/bin/uvx; \
     fi
-    
+
+# HF builder layers may place the cache and target environment on different
+# filesystems, where hardlinking is unavailable.
+ENV UV_LINK_MODE=copy
+
 # Install dependencies (and the project itself) in one sync pass.
 RUN --mount=type=cache,target=/root/.cache/uv \
     if [ -f uv.lock ]; then \
@@ -48,7 +52,9 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 
 # Install the FastAPI runtime into the project virtualenv explicitly.
 # Hugging Face/OpenEnv startup should not fall back to binaries from the base image.
-RUN /app/env/.venv/bin/pip install --no-cache-dir -r /app/env/server/requirements.txt
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install --python /app/env/.venv/bin/python \
+    --requirements /app/env/server/requirements.txt
 
 # Final runtime stage
 FROM ${BASE_IMAGE}
