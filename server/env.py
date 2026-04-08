@@ -12,16 +12,30 @@ from server.environment import ColdChainEnvironment as OpenEnvColdChainEnvironme
 class CurriculumWrapper(gym.Wrapper):
     def __init__(self, env):
         super().__init__(env)
-        self.difficulty = 1  
+        self.difficulty = 1
         self.success_count = 0
         self.successes_to_advance = 2
+        self.max_difficulty = 3
+        self.replay_prob = 0.0
+        self.replay_min_difficulty = 1
+        self._rng = np.random.default_rng()
 
     def reset(self, seed=None, options=None):
-        if self.difficulty < 3:
-            options = options or {}
-            options["curriculum_difficulty"] = self.difficulty
-            
+        if seed is not None:
+            self._rng = np.random.default_rng(seed)
+
+        options = dict(options or {})
+        effective_difficulty = self.difficulty
+        if self.difficulty > self.replay_min_difficulty and self.replay_prob > 0.0:
+            if float(self._rng.random()) < self.replay_prob:
+                low = max(1, int(self.replay_min_difficulty))
+                high = max(low + 1, int(self.difficulty))
+                effective_difficulty = int(self._rng.integers(low, high))
+
+        options["curriculum_difficulty"] = effective_difficulty
         obs, info = self.env.reset(seed=seed, options=options)
+        info = dict(info)
+        info["curriculum_difficulty"] = int(effective_difficulty)
         return obs, info
 
     def step(self, action):
@@ -32,7 +46,7 @@ class CurriculumWrapper(gym.Wrapper):
             self.success_count += 1
             print(f"DEBUG: Success count = {self.success_count}/{self.successes_to_advance} for Difficulty {self.difficulty}")
             if self.success_count >= self.successes_to_advance:
-                if self.difficulty < 3:
+                if self.difficulty < self.max_difficulty:
                     old_diff = self.difficulty
                     self.difficulty += 1
                     self.success_count = 0

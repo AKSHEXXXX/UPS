@@ -11,6 +11,18 @@ from .shipment import CARGO_SPECS, Shipment
 from .vehicle import Vehicle, VehicleStatus
 
 
+DIFFICULTY_REWARD_SCALE = {
+    1: {"delivery": 1.0, "milestone": 1.0, "shaping": 1.0, "penalty": 1.0},
+    2: {"delivery": 1.15, "milestone": 1.10, "shaping": 1.05, "penalty": 0.95},
+    3: {"delivery": 1.30, "milestone": 1.20, "shaping": 1.10, "penalty": 0.90},
+}
+
+
+def _difficulty_scale(env_state) -> dict:
+    difficulty = int(getattr(env_state, "difficulty", 3))
+    return DIFFICULTY_REWARD_SCALE.get(difficulty, DIFFICULTY_REWARD_SCALE[3])
+
+
 def temp_shaping_reward(shipments: List[Shipment], config: ColdChainConfig) -> float:
     total = 0.0
     for shipment in shipments:
@@ -288,6 +300,7 @@ def destruction_penalty_with_floor(penalty_scale: float, base_penalty: float = 5
 
 
 def compute_step_reward(env_state, action, prev_distances, config) -> Tuple[float, Dict]:
+    scale = _difficulty_scale(env_state)
     # 1. Calculate Penalty Annealing Scale (Fix 2)
     progress = min(float(config.current_training_step) / float(config.penalty_anneal_steps), 1.0)
     penalty_scale = config.penalty_initial_scale + (1.0 - config.penalty_initial_scale) * progress
@@ -326,15 +339,15 @@ def compute_step_reward(env_state, action, prev_distances, config) -> Tuple[floa
     # 2. Base components
     reward = (
         reward_temp
-        + reward_progress
+        + scale["shaping"] * reward_progress
         + reward_cost
-        + reward_idle
-        + reward_no_progress
-        + reward_time_pressure
+        + scale["penalty"] * reward_idle
+        + scale["penalty"] * reward_no_progress
+        + scale["penalty"] * reward_time_pressure
         + reward_repeat
         + reward_explore
         + reward_transit_action
-        + reward_transit_stall
+        + scale["penalty"] * reward_transit_stall
     )
 
     # 3. Dense Milestone Rewards (Fix 3)
@@ -362,7 +375,7 @@ def compute_step_reward(env_state, action, prev_distances, config) -> Tuple[floa
         and any(len(v.visited_nodes_this_route) > 2 for v in env_state.vehicles)
         and not env_state.milestones["departed"]
     ):
-        reward_milestones += 1.0
+        reward_milestones += 1.0 * scale["milestone"]
         env_state.milestones["departed"] = True
 
     # Halfway Milestone
@@ -383,7 +396,7 @@ def compute_step_reward(env_state, action, prev_distances, config) -> Tuple[floa
                     and current_dist < 0.5 * initial_dist
                     and not env_state.milestones["halfway"]
                 ):
-                    reward_milestones += 1.5
+                    reward_milestones += 1.5 * scale["milestone"]
                     env_state.milestones["halfway"] = True
 
     # 4. Delivery and Catastrophe Events (One-time only)
@@ -394,6 +407,7 @@ def compute_step_reward(env_state, action, prev_distances, config) -> Tuple[floa
         
         if shipment.is_delivered and not env_state.milestones.get(delivered_key):
             delivery_comp = delivery_event_reward(shipment, env_state.steps_elapsed, config)
+            delivery_comp *= scale["delivery"]
             reward_delivery_events += delivery_comp
             reward += delivery_comp
             env_state.milestones[delivered_key] = True
@@ -414,7 +428,7 @@ def compute_step_reward(env_state, action, prev_distances, config) -> Tuple[floa
 
     if all(shipment.is_delivered for shipment in env_state.shipments):
         if not env_state.milestones["delivered"]:
-            reward += 20.0  # Delivery bonus added AFTER clip — always fully visible
+            reward += 20.0 * scale["delivery"]  # Delivery bonus added AFTER clip — always fully visible
             env_state.milestones["delivered"] = True
     # NOTE: Continuous catastrophe penalty removed to prevent value function drowning.
     # Individual shipment destruction is already penalized once in delivery_event_reward.

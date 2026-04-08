@@ -18,10 +18,10 @@ if str(PROJECT_ROOT) not in sys.path:
 from server.env import ColdChainEnv, CurriculumWrapper
 from core.config import ColdChainConfig
 from evaluation.eval_contract import build_eval_env, run_eval_episode
+from core.graders import run_full_evaluation
 
 def get_mask(env):
     return env.unwrapped.action_masks()
-from core.graders import CompositeGrader
 
 class EntropyAnnealingCallback(BaseCallback):
     """Hold high entropy until delivery competence is reached, then anneal."""
@@ -244,45 +244,50 @@ class ExploitDetectorCallback(BaseCallback):
 
 def pre_training_gate(config, seed=42, n_steps=500, curriculum_difficulty=3):
     """Random masked rollout to ensure destruction exploit is unprofitable before training."""
-    env = ColdChainEnv(config=replace(config))
-    env = CurriculumWrapper(env)
-    env.difficulty = int(curriculum_difficulty)
-    env.successes_to_advance = 10**9
-    env = ActionMasker(env, get_mask)
-    env = gym.wrappers.FlattenObservation(env)
-
-    rng = np.random.default_rng(seed)
-    termination_counts = Counter()
-    total_episodes = 0
-    obs, _ = env.reset(seed=seed)
-
-    for _ in range(int(n_steps)):
-        mask = env.unwrapped.action_masks()
-        valid_actions = np.flatnonzero(mask)
-        if len(valid_actions) == 0:
-            break
-        action = int(rng.choice(valid_actions))
-        obs, _, terminated, truncated, info = env.step(action)
-        if terminated or truncated:
-            reason = str(info.get("termination_reason", "unknown"))
-            termination_counts[reason] += 1
-            total_episodes += 1
-            obs, _ = env.reset()
-
-    env.close()
-    destroy_rate = termination_counts.get("all_destroyed", 0) / float(max(total_episodes, 1))
     max_non_delivery_reward = 2.0 + 1.0 + 1.5 + 0.3
     destruction_penalty_at_floor = -50.0 * 0.5
     exploit_proof = abs(destruction_penalty_at_floor) > max_non_delivery_reward
 
+    gate_pass = exploit_proof
     print("\n=== PRE-TRAINING GATE ===")
-    print(f"  all_destroyed rate  : {destroy_rate * 100:.1f}%   {'✅' if destroy_rate < 0.1 else '🚨 FAIL'}")
     print(f"  destruction floor   : {destruction_penalty_at_floor}  {'✅' if exploit_proof else '🚨 FAIL'}")
     print(f"  max non-delivery rew: {max_non_delivery_reward}")
     print(f"  exploit-proof check : {'✅ PASS' if exploit_proof else '🚨 FAIL — increase base penalty'}")
-    print(f"  terminations        : {dict(termination_counts)}")
 
-    gate_pass = (destroy_rate < 0.1) and exploit_proof
+    rng = np.random.default_rng(seed)
+    sweep_limit = max(1, int(min(3, curriculum_difficulty)))
+    for diff in range(1, sweep_limit + 1):
+        env = ColdChainEnv(config=replace(config))
+        env = CurriculumWrapper(env)
+        env.difficulty = int(diff)
+        env.successes_to_advance = 10**9
+        env = ActionMasker(env, get_mask)
+        env = gym.wrappers.FlattenObservation(env)
+
+        termination_counts = Counter()
+        total_episodes = 0
+        obs, _ = env.reset(seed=seed + diff)
+
+        for _ in range(int(n_steps)):
+            mask = env.unwrapped.action_masks()
+            valid_actions = np.flatnonzero(mask)
+            if len(valid_actions) == 0:
+                break
+            action = int(rng.choice(valid_actions))
+            obs, _, terminated, truncated, info = env.step(action)
+            if terminated or truncated:
+                reason = str(info.get("termination_reason", "unknown"))
+                termination_counts[reason] += 1
+                total_episodes += 1
+                obs, _ = env.reset()
+
+        env.close()
+        destroy_rate = termination_counts.get("all_destroyed", 0) / float(max(total_episodes, 1))
+        passed = destroy_rate < 0.1
+        gate_pass = gate_pass and passed
+        print(f"  difficulty {diff}: all_destroyed rate={destroy_rate * 100:.1f}% {'✅' if passed else '🚨 FAIL'}")
+        print(f"    terminations: {dict(termination_counts)}")
+
     print(f"\n  GATE: {'✅ PASS — safe to train' if gate_pass else '🚨 FAIL — fix reward before training'}")
     return gate_pass
 
@@ -320,19 +325,102 @@ def run_termination_probe(model, config, seed=42, n_episodes=10, curriculum_diff
     print(f"  true_delivery_rate={true_deliveries / float(n_episodes):.2%}")
     return dict(reasons)
 
+
+def _row_by_tier(rows, tier_name):
+    for row in rows:
+        if str(row.get("tier", "")).lower() == str(tier_name).lower():
+            return row
+    return {}
+
+
+def robust_tier_score(report):
+    rows = report.get("rows", [])
+    easy = float(_row_by_tier(rows, "easy").get("score", 0.0))
+    moderate = float(_row_by_tier(rows, "moderate").get("score", 0.0))
+    hard = float(_row_by_tier(rows, "hard").get("score", 0.0))
+    extreme = float(_row_by_tier(rows, "extreme").get("score", 0.0))
+    # Bias model quality toward difficult conditions.
+    return 0.10 * easy + 0.20 * moderate + 0.35 * hard + 0.35 * extreme
+
+
+def run_acceptance_seed_sweep(model, seeds, evaluation_training_step, deterministic=True, trace_every=0):
+    print("\n[Acceptance Seed Sweep]")
+    print(f"  > Seeds: {list(seeds)}")
+
+    per_seed_reports = []
+    for seed in seeds:
+        report = run_full_evaluation(
+            model,
+            seed=int(seed),
+            deterministic=bool(deterministic),
+            evaluation_training_step=int(evaluation_training_step),
+            trace_every=int(trace_every),
+        )
+        score = robust_tier_score(report)
+        rows = report.get("rows", [])
+        hard = float(_row_by_tier(rows, "hard").get("score", 0.0))
+        extreme = float(_row_by_tier(rows, "extreme").get("score", 0.0))
+        per_seed_reports.append({"seed": int(seed), "robust_score": score, "hard": hard, "extreme": extreme})
+        print(f"  > seed={seed}: robust={score:.4f}, hard={hard:.4f}, extreme={extreme:.4f}")
+
+    robust_scores = [x["robust_score"] for x in per_seed_reports]
+    hard_scores = [x["hard"] for x in per_seed_reports]
+    extreme_scores = [x["extreme"] for x in per_seed_reports]
+
+    summary = {
+        "robust_score_mean": float(np.mean(robust_scores)) if robust_scores else 0.0,
+        "robust_score_min": float(np.min(robust_scores)) if robust_scores else 0.0,
+        "hard_mean": float(np.mean(hard_scores)) if hard_scores else 0.0,
+        "hard_min": float(np.min(hard_scores)) if hard_scores else 0.0,
+        "extreme_mean": float(np.mean(extreme_scores)) if extreme_scores else 0.0,
+        "extreme_min": float(np.min(extreme_scores)) if extreme_scores else 0.0,
+        "per_seed": per_seed_reports,
+    }
+
+    print(
+        "  > Summary: "
+        f"robust_mean={summary['robust_score_mean']:.4f}, robust_min={summary['robust_score_min']:.4f}, "
+        f"hard_mean={summary['hard_mean']:.4f}, hard_min={summary['hard_min']:.4f}, "
+        f"extreme_mean={summary['extreme_mean']:.4f}, extreme_min={summary['extreme_min']:.4f}"
+    )
+    return summary
+
 def run_training_phase(phase, steps, resume_path=None, seed=42):
     print(f"\n--- [Phase {phase}] Training for {steps} steps ---")
 
-    curriculum_difficulty = 1 if phase == 1 else 3
-    
-    config = ColdChainConfig(
+    curriculum_difficulty = 1 if phase == 1 else (2 if phase == 2 else 3)
+
+    config_kwargs = dict(
         n_vehicles=1,
         n_nodes=10,
         n_shipments=1,
         max_shipments=1,
         max_steps=200,
-        penalty_anneal_steps=30000
+        penalty_anneal_steps=30000,
+        penalty_initial_scale=0.10,
     )
+    if phase >= 2:
+        config_kwargs.update(
+            weather_events_enabled=True,
+            breakdown_probability=0.004,
+            refrigeration_degradation_prob=0.008,
+            penalty_anneal_steps=40000,
+        )
+    if phase >= 3:
+        config_kwargs.update(
+            breakdown_probability=0.01,
+            refrigeration_degradation_prob=0.012,
+            penalty_anneal_steps=60000,
+            penalty_initial_scale=0.15,
+        )
+
+    if resume_path is None:
+        if phase >= 2:
+            config_kwargs["max_steps"] = 240
+        if phase >= 3:
+            config_kwargs["max_steps"] = 300
+
+    config = ColdChainConfig(**config_kwargs)
     
     # Run exploit-proof gate on stable base difficulty so it measures reward-path
     # exploitability rather than random destruction noise at hard difficulty.
@@ -343,15 +431,25 @@ def run_training_phase(phase, steps, resume_path=None, seed=42):
     env = ColdChainEnv(config=config)
     env = CurriculumWrapper(env)
     env.difficulty = int(curriculum_difficulty)
-    # Keep phase difficulty fixed so training, callbacks, and validation use the same regime.
-    env.successes_to_advance = 10**9
+    # Phase 3 benefits from replaying easier regimes so the policy does not
+    # overfit the hardest rollout shape and forget the stable behaviors.
+    if phase == 3:
+        env.successes_to_advance = 50
+        env.replay_prob = 0.15
+        env.replay_min_difficulty = 1
+        env.max_difficulty = 3
+    else:
+        # Keep the earlier phases anchored so the phase-specific evaluation
+        # remains predictable and quick.
+        env.successes_to_advance = 10**9
+        env.replay_prob = 0.0
     env = ActionMasker(env, get_mask) # Add masking wrapper
     env = Monitor(env, info_keywords=("delivery_success",))
     env = gym.wrappers.FlattenObservation(env)
     
     anneal_callback = AnnealingCallback(steps_to_full=30000)
     ent_callback = EntropyAnnealingCallback(start_ent=0.05, end_ent=0.01, min_delivery_rate=0.5, decay_steps=120000, min_entropy_floor=0.01)
-    check_every = 500 if phase == 1 else 5000
+    check_every = 500 if phase == 1 else (3000 if phase == 2 else 5000)
     illegal_action_callback = IllegalActionCheckCallback(
         config,
         curriculum_difficulty=curriculum_difficulty,
@@ -375,15 +473,30 @@ def run_training_phase(phase, steps, resume_path=None, seed=42):
         model = MaskablePPO.load(resume_path, env=env)
         # Update model parameters if needed
     else:
+        if phase == 1:
+            learning_rate = 1e-4
+            n_steps = 256
+            batch_size = 64
+            n_epochs = 4
+        elif phase == 2:
+            learning_rate = 7e-5
+            n_steps = 512
+            batch_size = 128
+            n_epochs = 6
+        else:
+            learning_rate = 4e-5
+            n_steps = 512
+            batch_size = 128
+            n_epochs = 6
         model = MaskablePPO(
             "MlpPolicy",
             env,
-            n_steps=256,
-            batch_size=64,
-            n_epochs=4,
+            n_steps=n_steps,
+            batch_size=batch_size,
+            n_epochs=n_epochs,
             ent_coef=0.05,
-            learning_rate=1e-4,
-            gamma=0.995,
+            learning_rate=learning_rate,
+            gamma=0.998 if phase >= 3 else 0.995,
             verbose=1,
             seed=seed
         )
@@ -399,6 +512,19 @@ def run_training_phase(phase, steps, resume_path=None, seed=42):
     validate_model(model, config, seed, curriculum_difficulty=curriculum_difficulty, delivery_only_rate=delivery_only_callback.latest_true_delivery_rate)
     if phase == 3:
         run_termination_probe(model, config, seed=seed, n_episodes=10, curriculum_difficulty=curriculum_difficulty)
+        eval_step = max(int(model.num_timesteps), int(config.penalty_anneal_steps))
+        sweep = run_acceptance_seed_sweep(
+            model,
+            seeds=[42, 101, 202, 303, 404],
+            evaluation_training_step=eval_step,
+            deterministic=True,
+        )
+        if sweep["hard_mean"] >= 0.60 and sweep["extreme_mean"] >= 0.45 and sweep["robust_score_mean"] >= 0.58:
+            robust_path = "models/ppo_phase3_robust_ready.zip"
+            model.save(robust_path)
+            print(f"✓ Robustness gate passed. Snapshot saved to {robust_path}")
+        else:
+            print("! Robustness gate not met. Keep training on phase 3 with harder seeds.")
     return model
 
 def validate_model(model, config, seed, curriculum_difficulty=3, delivery_only_rate=0.0):
@@ -484,6 +610,34 @@ def validate_model(model, config, seed, curriculum_difficulty=3, delivery_only_r
         if not all(gate_checks.values()):
             print("  ! PHASE 3 NOT SIGNED OFF: one or more hard gates failed.")
 
+        tier_report = run_full_evaluation(
+            model,
+            seed=seed,
+            deterministic=True,
+            evaluation_training_step=eval_training_step,
+            trace_every=0,
+        )
+        rows = tier_report.get("rows", [])
+        hard_row = _row_by_tier(rows, "hard")
+        extreme_row = _row_by_tier(rows, "extreme")
+        print("  > Tier diagnostics (deterministic):")
+        if hard_row:
+            print(
+                f"    - hard: score={float(hard_row.get('score', 0.0)):.4f}, "
+                f"delivery={float(hard_row.get('delivery_ratio', 0.0)):.4f}, "
+                f"speed={float(hard_row.get('speed_ratio', 0.0)):.4f}, "
+                f"eff={float(hard_row.get('efficiency_ratio', 0.0)):.4f}, "
+                f"triage={float(hard_row.get('triage_score', 0.0)):.4f}"
+            )
+        if extreme_row:
+            print(
+                f"    - extreme: score={float(extreme_row.get('score', 0.0)):.4f}, "
+                f"delivery={float(extreme_row.get('delivery_ratio', 0.0)):.4f}, "
+                f"speed={float(extreme_row.get('speed_ratio', 0.0)):.4f}, "
+                f"eff={float(extreme_row.get('efficiency_ratio', 0.0)):.4f}, "
+                f"triage={float(extreme_row.get('triage_score', 0.0)):.4f}"
+            )
+
     eval_env.close()
 
 if __name__ == "__main__":
@@ -496,7 +650,7 @@ if __name__ == "__main__":
     phases = {
         1: 1000,
         2: 10000,
-        3: 50000
+        3: 150000
     }
     
     run_training_phase(args.phase, phases[args.phase], args.resume, args.seed)

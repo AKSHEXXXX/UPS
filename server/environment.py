@@ -269,6 +269,7 @@ class ColdChainEnvironment(Environment):
             vehicles=self.vehicles,
             graph=self.graph,
             steps_elapsed=self.steps_elapsed,
+            difficulty=self.difficulty,
             _prev_distances=self._prev_distances,
             node_visit_counts=self._node_visit_counts,
             milestones=self.milestones,
