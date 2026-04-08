@@ -1,0 +1,32 @@
+============================= test session starts ==============================
+platform darwin -- Python 3.14.3, pytest-9.0.2, pluggy-1.6.0
+rootdir: /Users/akshatsaxena/Desktop/RL/gym
+configfile: pyproject.toml
+plugins: anyio-4.13.0
+collected 42 items
+
+tests/test_debug_systems.py ...................                          [ 45%]
+tests/test_env_api.py ..                                                 [ 50%]
+tests/test_graders.py .                                                  [ 52%]
+tests/test_openenv_client.py .                                           [ 54%]
+tests/test_openenv_integration.py .                                      [ 57%]
+tests/test_phase11_comprehensive.py ........                             [ 76%]
+tests/test_ppo_training.py ..........                                    [100%]
+
+=============================== warnings summary ===============================
+tests/test_debug_systems.py: 7 warnings
+tests/test_phase11_comprehensive.py: 5 warnings
+tests/test_ppo_training.py: 8 warnings
+  /Users/akshatsaxena/Desktop/RL/gym/server/environment.py:113: RuntimeWarning: Illegal action received; forcing WAIT
+    warnings.warn("Illegal action received; forcing WAIT", RuntimeWarning)
+
+tests/test_phase11_comprehensive.py::test_gymnasium_compliance_strict
+  /Users/akshatsaxena/Desktop/RL/gym/.venv/lib/python3.14/site-packages/gymnasium/utils/env_checker.py:367: UserWarning: [33mWARN: `check_env(warn=...)` parameter is now ignored.[0m
+    logger.warn("`check_env(warn=...)` parameter is now ignored.")
+
+tests/test_phase11_comprehensive.py::test_gymnasium_compliance_strict
+  /Users/akshatsaxena/Desktop/RL/gym/.venv/lib/python3.14/site-packages/gymnasium/utils/env_checker.py:434: UserWarning: [33mWARN: Not able to test alternative render modes due to the environment not having a spec. Try instantiating the environment through `gymnasium.make`[0m
+    logger.warn(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+======================= 42 passed, 22 warnings in 52.67s =======================
