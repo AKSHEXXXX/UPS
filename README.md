@@ -1,3 +1,11 @@
+---
+title: coldchain-gym
+colorFrom: blue
+colorTo: green
+sdk: docker
+pinned: false
+---
+
 # UPS
 
 The UPS models pharmaceutical cold-chain logistics where an RL agent dispatches refrigerated vehicles under weather, traffic, and equipment uncertainty.

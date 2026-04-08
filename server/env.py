@@ -138,7 +138,15 @@ class ColdChainEnv(gym.Env):
         return self._convert_observation(observation), info
 
     def step(self, action):
-        a = int(action)
+        if isinstance(action, (list, tuple, np.ndarray)):
+            if len(action) != 3:
+                raise ValueError("Structured action must contain [vehicle_index, action_type, target_index]")
+            vehicle_index = int(action[0])
+            action_type = int(action[1])
+            target_index = int(action[2])
+            a = vehicle_index * (6 * self.config.n_nodes) + action_type * self.config.n_nodes + target_index
+        else:
+            a = int(action)
         
         # Decode action
         n_nodes = self.config.n_nodes
