@@ -115,9 +115,20 @@ def run_eval_episode(
         action_parts = decode_flat_action(action_int, raw_env.config.n_nodes)
         action_type_counts[action_parts["action_type"]] += 1
 
+        current_obs = np.array(obs, copy=True)
+        current_mask = np.array(mask, copy=True)
         next_obs, reward, terminated, truncated, info = env.step(action_int)
         if collect_trajectory:
-            trajectory.append((next_obs, action_int, float(reward), dict(info)))
+            trajectory.append(
+                {
+                    "obs": current_obs,
+                    "action": int(action_int),
+                    "mask": current_mask,
+                    "next_obs": np.array(next_obs, copy=True),
+                    "reward": float(reward),
+                    "info": dict(info),
+                }
+            )
 
         if trace_every > 0 and (raw_env.steps_elapsed % trace_every == 0 or terminated or truncated):
             print(
@@ -152,5 +163,9 @@ def run_eval_episode(
         "initial_legal_actions": int(first_legal_actions),
         "action_type_counts": action_type_counts,
         "trajectory": trajectory,
+        "final_info": dict(info),
+        "per_shipment_status": dict(info.get("per_shipment_status", {})),
+        "per_vehicle_status": dict(info.get("per_vehicle_status", {})),
+        "grader_scores": dict(info.get("grader_scores", {})),
         "graph_snapshot": graph_snapshot,
     }

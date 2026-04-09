@@ -15,6 +15,7 @@ def test_gymnasium_compliance():
 def test_obs_shape_consistent():
     env = ColdChainEnv()
     obs, _ = env.reset(seed=0)
+    assert obs["global"].shape == (10,)
     assert obs["vehicles"].shape == (env.config.n_vehicles, 9 + env.config.max_cargo_per_vehicle)
     assert obs["shipments"].shape == (env.config.max_shipments, 13)
 

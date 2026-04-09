@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any, Dict
+
 from .base import BaseGrader
 
 
@@ -12,12 +14,28 @@ def _action_type(action) -> int:
         return 0
 
 
+def _transition_action(transition: Any):
+    if isinstance(transition, dict):
+        return transition.get("action")
+    if isinstance(transition, (tuple, list)) and len(transition) > 1:
+        return transition[1]
+    return None
+
+
+def _transition_info(transition: Any) -> Dict:
+    if isinstance(transition, dict):
+        return dict(transition.get("info", {}))
+    if isinstance(transition, (tuple, list)) and len(transition) > 3 and isinstance(transition[3], dict):
+        return dict(transition[3])
+    return {}
+
+
 class EfficiencyGrader(BaseGrader):
     def _compute(self) -> float:
         if not self.trajectory:
             return 0.0
 
-        final_info = self.trajectory[-1][3] if len(self.trajectory[-1]) > 3 else {}
+        final_info = _transition_info(self.trajectory[-1])
         shipment_states = final_info.get("per_shipment_status", {})
         vehicle_states = final_info.get("per_vehicle_status", {})
 
@@ -27,7 +45,9 @@ class EfficiencyGrader(BaseGrader):
         abort_count = 0
         unnecessary_aborts = 0
 
-        for obs, action, reward, info in self.trajectory:
+        for transition in self.trajectory:
+            action = _transition_action(transition)
+            info = _transition_info(transition)
             action_type = _action_type(action)
             if action_type == 4:
                 fuel_used += 0.1

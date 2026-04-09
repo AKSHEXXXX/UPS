@@ -70,6 +70,9 @@ outputs/
 log_outputs/
 artifacts/generated/
 *.log
+phase*_smoke*.log
+phase*_norm*.log
+phase*_run*.log
 
 # Training artifacts (Stable-Baselines3)
 logs/

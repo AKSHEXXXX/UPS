@@ -29,12 +29,13 @@ class Shipment:
     in_excursion: bool = False
     is_destroyed: bool = False
     is_delivered: bool = False
+    is_active: bool = True
     steps_since_last_reading: int = 0
     active_since_step: int = 0
 
 
 def update_temperature(shipment: Shipment, ambient_hold_temp: float, step_duration_hours: float) -> None:
-    if shipment.is_destroyed or shipment.is_delivered:
+    if not shipment.is_active or shipment.is_destroyed or shipment.is_delivered:
         return
 
     k = CARGO_SPECS[shipment.cargo_type]["k"]

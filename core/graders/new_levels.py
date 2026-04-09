@@ -17,6 +17,14 @@ class ScenarioCase:
     risky_shipment_ids: Sequence[int] = ()
 
 
+def _transition_info(transition: Any) -> Dict[str, Any]:
+    if isinstance(transition, dict):
+        return dict(transition.get("info", {}))
+    if isinstance(transition, (tuple, list)) and len(transition) > 3 and isinstance(transition[3], dict):
+        return dict(transition[3])
+    return {}
+
+
 def _cargo_type_name(value: Any) -> str:
     if isinstance(value, str):
         return value
@@ -106,7 +114,7 @@ class ScenarioGraderBase:
         thermal_scores: List[float] = []
         safety_scores: List[float] = []
 
-        final_info = trajectory[-1][3] if trajectory else {}
+        final_info = _transition_info(trajectory[-1]) if trajectory else {}
         shipment_status = final_info.get("per_shipment_status", {})
         vehicle_status = final_info.get("per_vehicle_status", {})
 
@@ -144,7 +152,8 @@ class ScenarioGraderBase:
         }
 
     def _delivery_step(self, trajectory: List[Any], shipment_id: int) -> int | None:
-        for step_index, (_, _, _, info) in enumerate(trajectory, start=1):
+        for step_index, transition in enumerate(trajectory, start=1):
+            info = _transition_info(transition)
             if info.get("per_shipment_status", {}).get(shipment_id, {}).get("is_delivered"):
                 return step_index
         return None
@@ -184,14 +193,15 @@ class ScenarioGraderBase:
         start_node = int(vehicle_starts[vehicle_id])
         destination = int(shipment_destinations[shipment_id])
         risky_limit = float(CARGO_SPECS[_cargo_type_name(case.reset_options.get("shipment_cargo_types", ["blood"])[shipment_id])]["high"])
-        final_info = trajectory[-1][3] if trajectory else {}
+        final_info = _transition_info(trajectory[-1]) if trajectory else {}
         shipment_info = final_info.get("per_shipment_status", {}).get(shipment_id, {})
         cargo_temp = float(shipment_info.get("cargo_temp", risky_limit))
         if cargo_temp <= risky_limit:
             return 1.0
 
         vehicle_path = [start_node]
-        for _, _, _, info in trajectory:
+        for transition in trajectory:
+            info = _transition_info(transition)
             vehicle_snapshot = info.get("per_vehicle_status", {}).get(vehicle_id, {})
             if "location" in vehicle_snapshot:
                 vehicle_path.append(int(vehicle_snapshot["location"]))
@@ -348,7 +358,8 @@ class HardGrader(ScenarioGraderBase):
 
 def _shipment_delivery_steps(trajectory: List[Any], n_shipments: int) -> Dict[int, int]:
     delivery_steps: Dict[int, int] = {}
-    for step_index, (_, _, _, info) in enumerate(trajectory, start=1):
+    for step_index, transition in enumerate(trajectory, start=1):
+        info = _transition_info(transition)
         shipment_status = info.get("per_shipment_status", {})
         for shipment_id in range(n_shipments):
             if shipment_id in delivery_steps:
@@ -369,7 +380,7 @@ def _cargo_multiplier(cargo_type: str) -> float:
 
 def _episode_metrics(case: ScenarioCase, result: Dict[str, Any]) -> Dict[str, float]:
     trajectory = result.get("trajectory", [])
-    final_info = trajectory[-1][3] if trajectory else {}
+    final_info = _transition_info(trajectory[-1]) if trajectory else {}
     shipment_status = final_info.get("per_shipment_status", {})
     shipment_count = int(case.config.n_shipments)
     delivery_steps = _shipment_delivery_steps(trajectory, shipment_count)

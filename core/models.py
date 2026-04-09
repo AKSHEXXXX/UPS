@@ -26,6 +26,9 @@ class GlobalTelemetry(BaseModel):
     hub_cold_storage_temp: float = Field(..., description="Hub cold storage temperature in Celsius")
     steps_elapsed: int = Field(..., description="Episode steps elapsed")
     steps_remaining: int = Field(..., description="Episode steps remaining")
+    difficulty_level_norm: float = Field(..., description="Normalized difficulty in [0,1]")
+    active_shipments_norm: float = Field(..., description="Normalized active shipment count in [0,1]")
+    active_vehicles_norm: float = Field(..., description="Normalized active vehicle count in [0,1]")
 
 
 class VehicleTelemetry(BaseModel):

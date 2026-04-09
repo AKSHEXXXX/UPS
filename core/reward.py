@@ -8,25 +8,31 @@ import numpy as np
 
 from .config import ColdChainConfig
 from .shipment import CARGO_SPECS, Shipment
-from .vehicle import Vehicle, VehicleStatus
+from .vehicle import RefrigStatus, Vehicle, VehicleStatus
 
 
 DIFFICULTY_REWARD_SCALE = {
     1: {"delivery": 1.0, "milestone": 1.0, "shaping": 1.0, "penalty": 1.0},
     2: {"delivery": 1.15, "milestone": 1.10, "shaping": 1.05, "penalty": 0.95},
     3: {"delivery": 1.30, "milestone": 1.20, "shaping": 1.10, "penalty": 0.90},
+    4: {"delivery": 1.50, "milestone": 1.35, "shaping": 1.20, "penalty": 0.85},
+    5: {"delivery": 1.70, "milestone": 1.50, "shaping": 1.30, "penalty": 0.80},
 }
 
 
 def _difficulty_scale(env_state) -> dict:
     difficulty = int(getattr(env_state, "difficulty", 3))
-    return DIFFICULTY_REWARD_SCALE.get(difficulty, DIFFICULTY_REWARD_SCALE[3])
+    return DIFFICULTY_REWARD_SCALE.get(difficulty, DIFFICULTY_REWARD_SCALE[5])
+
+
+def _is_active_shipment(shipment: Shipment) -> bool:
+    return bool(getattr(shipment, "is_active", True))
 
 
 def temp_shaping_reward(shipments: List[Shipment], config: ColdChainConfig) -> float:
     total = 0.0
     for shipment in shipments:
-        if shipment.is_delivered or shipment.is_destroyed:
+        if not _is_active_shipment(shipment) or shipment.is_delivered or shipment.is_destroyed:
             continue
         if shipment.cargo_temp < shipment.temp_lower_bound or shipment.cargo_temp > shipment.temp_upper_bound:
             distance = max(shipment.temp_lower_bound - shipment.cargo_temp, shipment.cargo_temp - shipment.temp_upper_bound)
@@ -55,7 +61,7 @@ def progress_shaping_reward(
             if shipment_id >= len(shipments):
                 continue
             shipment = shipments[shipment_id]
-            if shipment.is_delivered or shipment.is_destroyed:
+            if not _is_active_shipment(shipment) or shipment.is_delivered or shipment.is_destroyed:
                 continue
             current_distance = nx.shortest_path_length(graph, vehicle.location, shipment.destination_node, weight="current_weight")
             previous_distance = prev_distances.get((vehicle.id, shipment.id), current_distance)
@@ -148,7 +154,7 @@ def transit_action_reward(action_type: int, vehicle: Vehicle, graph: nx.Graph, s
         if shipment_id >= len(shipments):
             continue
         shipment = shipments[shipment_id]
-        if shipment.is_delivered or shipment.is_destroyed:
+        if not _is_active_shipment(shipment) or shipment.is_delivered or shipment.is_destroyed:
             continue
         current_distance = nx.shortest_path_length(graph, vehicle.location, shipment.destination_node, weight="current_weight")
         previous_distance = prev_distances.get((vehicle.id, shipment.id), current_distance)
@@ -203,8 +209,40 @@ def transit_stall_penalty(env_state, config: ColdChainConfig) -> float:
     return float(total)
 
 
+def refrigeration_reaction_reward(
+    vehicle: Vehicle,
+    shipments: List[Shipment],
+    action_type: int,
+    config: ColdChainConfig,
+) -> float:
+    if not bool(getattr(config, "enable_refrigeration_reaction", False)):
+        return 0.0
+    if vehicle.refrig_status == RefrigStatus.WORKING:
+        return 0.0
+
+    has_active_cargo = False
+    for shipment_id in vehicle.shipments_onboard:
+        if shipment_id >= len(shipments):
+            continue
+        shipment = shipments[shipment_id]
+        if _is_active_shipment(shipment) and not shipment.is_delivered and not shipment.is_destroyed:
+            has_active_cargo = True
+            break
+    if not has_active_cargo:
+        return 0.0
+
+    urgency = 1.0 if vehicle.refrig_status == RefrigStatus.FAILED else 0.5
+    bonus = float(getattr(config, "refrigeration_reaction_bonus", 0.30))
+    penalty = float(getattr(config, "refrigeration_reaction_penalty", 0.15))
+    if action_type == 2:  # DIVERT_COLD_DEPOT
+        return bonus * urgency
+    if action_type == 1:  # REROUTE while refrigeration is degraded/failed
+        return -penalty * urgency
+    return 0.0
+
+
 def idle_penalty_reward(vehicles: List[Vehicle], shipments: List[Shipment], config: ColdChainConfig) -> float:
-    if not any(not shipment.is_delivered and not shipment.is_destroyed for shipment in shipments):
+    if not any(_is_active_shipment(shipment) and not shipment.is_delivered and not shipment.is_destroyed for shipment in shipments):
         return 0.0
     total = 0.0
     for vehicle in vehicles:
@@ -254,7 +292,7 @@ def time_pressure_penalty(vehicles: List[Vehicle], shipments: List[Shipment], st
             if shipment_id >= len(shipments):
                 continue
             shipment = shipments[shipment_id]
-            if shipment.is_delivered or shipment.is_destroyed:
+            if not _is_active_shipment(shipment) or shipment.is_delivered or shipment.is_destroyed:
                 continue
             dist_to_dest = float(getattr(vehicle, "steps_to_destination", max_steps))
             # Normalise distance: far away = big penalty, near = small
@@ -294,9 +332,67 @@ def catastrophe_event_reward(shipment: Shipment, config: ColdChainConfig) -> flo
     return -50.0
 
 
+def partial_delivery_terminal_reward(shipments: List[Shipment]) -> float:
+    active_shipments = [shipment for shipment in shipments if _is_active_shipment(shipment)]
+    if len(active_shipments) <= 1:
+        return 0.0
+    delivered = sum(int(shipment.is_delivered) for shipment in active_shipments)
+    total = len(active_shipments)
+    partial_ratio = delivered / float(max(total, 1))
+    return float(30.0 * (partial_ratio ** 2) - 5.0 * float(total - delivered))
+
+
 def destruction_penalty_with_floor(penalty_scale: float, base_penalty: float = 50.0, floor_scale: float = 0.5) -> float:
     effective_scale = max(float(penalty_scale), float(floor_scale))
     return float(-base_penalty * effective_scale)
+
+
+def _difficulty_reward_normalize(raw_reward: float, env_state, config: ColdChainConfig) -> tuple[float, Dict[str, float]]:
+    difficulty = int(getattr(env_state, "difficulty", 3))
+    state = getattr(env_state, "_reward_norm_state", None)
+    if not isinstance(state, dict):
+        state = {}
+
+    stats = state.get(difficulty, {"mean": 0.0, "var": 1.0, "count": 0})
+    mean = float(stats.get("mean", 0.0))
+    var = max(float(stats.get("var", 1.0)), 1e-6)
+    count = int(stats.get("count", 0))
+    alpha = min(max(float(config.reward_norm_alpha), 1e-6), 1.0)
+
+    if count == 0:
+        updated_mean = float(raw_reward)
+        updated_var = 1.0
+    else:
+        delta = float(raw_reward) - mean
+        updated_mean = (1.0 - alpha) * mean + alpha * float(raw_reward)
+        # EMA variance update around the previous mean for stable early estimates.
+        updated_var = max((1.0 - alpha) * var + alpha * (delta * delta), 1e-6)
+
+    updated_count = count + 1
+    state[difficulty] = {
+        "mean": float(updated_mean),
+        "var": float(updated_var),
+        "count": int(updated_count),
+    }
+    setattr(env_state, "_reward_norm_state", state)
+
+    if updated_count < max(int(config.reward_norm_warmup_steps), 1):
+        return float(raw_reward), {
+            "norm_applied": 0.0,
+            "norm_mean": float(updated_mean),
+            "norm_std": float(np.sqrt(updated_var)),
+            "norm_count": float(updated_count),
+        }
+
+    std = float(np.sqrt(updated_var))
+    normalized = (float(raw_reward) - float(updated_mean)) / max(std, 1e-6)
+    clipped = float(np.clip(normalized, -float(config.reward_norm_clip), float(config.reward_norm_clip)))
+    return clipped, {
+        "norm_applied": 1.0,
+        "norm_mean": float(updated_mean),
+        "norm_std": float(std),
+        "norm_count": float(updated_count),
+    }
 
 
 def compute_step_reward(env_state, action, prev_distances, config) -> Tuple[float, Dict]:
@@ -321,7 +417,7 @@ def compute_step_reward(env_state, action, prev_distances, config) -> Tuple[floa
     reward_idle = idle_penalty_reward(env_state.vehicles, env_state.shipments, config)
     reward_idle += depot_stall_penalty(env_state.vehicles, env_state.graph)
     reward_no_progress = no_progress_penalty_reward(env_state.vehicles, env_state.shipments, config)
-    active_shipments = sum(int(not shipment.is_delivered and not shipment.is_destroyed) for shipment in env_state.shipments)
+    active_shipments = sum(int(_is_active_shipment(shipment) and not shipment.is_delivered and not shipment.is_destroyed) for shipment in env_state.shipments)
     reward_time_pressure = time_pressure_penalty(env_state.vehicles, env_state.shipments, env_state.steps_elapsed, config.max_steps)
     action_type = int(getattr(env_state, "action_type", 0))
     action_repeat_count = int(getattr(env_state, "action_repeat_count", 1))
@@ -331,6 +427,7 @@ def compute_step_reward(env_state, action, prev_distances, config) -> Tuple[floa
     if len(env_state.vehicles) > 0:
         reward_transit_action = transit_action_reward(action_type, env_state.vehicles[0], env_state.graph, env_state.shipments, prev_distances)
     reward_transit_stall = transit_stall_penalty(env_state, config)
+    reward_refrig_reaction = refrigeration_reaction_reward(selected_vehicle, env_state.shipments, action_type, config)
 
     reward_delivery_events = 0.0
     reward_catastrophe = 0.0
@@ -348,6 +445,7 @@ def compute_step_reward(env_state, action, prev_distances, config) -> Tuple[floa
         + reward_explore
         + reward_transit_action
         + scale["penalty"] * reward_transit_stall
+        + reward_refrig_reaction
     )
 
     # 3. Dense Milestone Rewards (Fix 3)
@@ -401,6 +499,8 @@ def compute_step_reward(env_state, action, prev_distances, config) -> Tuple[floa
 
     # 4. Delivery and Catastrophe Events (One-time only)
     for shipment in env_state.shipments:
+        if not _is_active_shipment(shipment):
+            continue
         # Unique milestone keys for each shipment
         delivered_key = f"delivered_{shipment.id}"
         destroyed_key = f"destroyed_{shipment.id}"
@@ -426,13 +526,24 @@ def compute_step_reward(env_state, action, prev_distances, config) -> Tuple[floa
     # so the full +500 delivery bonus always reaches the policy gradient uncapped.
     reward = float(np.clip(reward, -2.0, 2.0))
 
-    if all(shipment.is_delivered for shipment in env_state.shipments):
+    active_shipments_for_bonus = [shipment for shipment in env_state.shipments if _is_active_shipment(shipment)]
+    if active_shipments_for_bonus and all(shipment.is_delivered for shipment in active_shipments_for_bonus):
         if not env_state.milestones["delivered"]:
             reward += 20.0 * scale["delivery"]  # Delivery bonus added AFTER clip — always fully visible
             env_state.milestones["delivered"] = True
     # NOTE: Continuous catastrophe penalty removed to prevent value function drowning.
     # Individual shipment destruction is already penalized once in delivery_event_reward.
     
+    reward_before_norm = float(reward)
+    norm_details = {
+        "norm_applied": 0.0,
+        "norm_mean": 0.0,
+        "norm_std": 1.0,
+        "norm_count": 0.0,
+    }
+    if bool(getattr(config, "enable_difficulty_reward_normalization", False)):
+        reward, norm_details = _difficulty_reward_normalize(reward_before_norm, env_state, config)
+
     breakdown = {
         "r_temp": reward_temp,
         "r_progress": reward_progress,
@@ -444,8 +555,15 @@ def compute_step_reward(env_state, action, prev_distances, config) -> Tuple[floa
         "r_explore": reward_explore,
         "r_transit_action": reward_transit_action,
         "r_transit_stall": reward_transit_stall,
+        "r_refrigeration_reaction": reward_refrig_reaction,
         "r_delivery_events": reward_delivery_events,
         "r_catastrophe": reward_catastrophe,
         "r_milestones": reward_milestones,
+        "r_before_norm": reward_before_norm,
+        "r_after_norm": float(reward),
+        "r_norm_applied": norm_details["norm_applied"],
+        "r_norm_mean": norm_details["norm_mean"],
+        "r_norm_std": norm_details["norm_std"],
+        "r_norm_count": norm_details["norm_count"],
     }
     return reward, breakdown

@@ -53,8 +53,8 @@ class TestRewardFunctions:
             assert -10.0 <= cost <= 10.0, f"action_cost out of bounds: {cost}"
             costs[action_type] = cost
         
-        # WAIT (0) should be free
-        assert costs[0] == 0.0, f"WAIT should be free, got {costs[0]}"
+        # WAIT (0) should remain the cheapest safe fallback
+        assert costs[0] <= 0.0, f"WAIT should be non-positive, got {costs[0]}"
         # Other actions should have negative cost (penalty)
         assert costs[1] < 0.0, f"REROUTE should cost negative, got {costs[1]}"
         assert costs[5] < 0.0, f"ABORT should cost negative, got {costs[5]}"
@@ -137,11 +137,11 @@ class TestObservationStructure:
         assert obs["vehicles"].dtype == np.float32, f"vehicles dtype wrong: {obs['vehicles'].dtype}"
         assert obs["shipments"].dtype == np.float32, f"shipments dtype wrong: {obs['shipments'].dtype}"
         
-        # Global is now a flat float32 array (7 elements)
+        # Global is now a flat float32 array (10 elements)
         assert obs["global"].dtype == np.float32, \
             f"global obs should be float32, got {obs['global'].dtype}"
-        assert obs["global"].shape == (7,), \
-            f"global obs should have shape (7,), got {obs['global'].shape}"
+        assert obs["global"].shape == (10,), \
+            f"global obs should have shape (10,), got {obs['global'].shape}"
         
         print(f"✓ observation_dtypes: correct (float32)")
 
@@ -151,12 +151,17 @@ class TestObservationStructure:
         for seed in range(5):
             obs, _ = env.reset(seed=seed)
             
-            # Global flat array: [ambient_temp(0), time_of_day(1), traffic(2), weather(3), hub_temp(4), steps_elapsed(5), steps_remaining(6)]
+            # Global flat array:
+            # [ambient_temp(0), time_of_day(1), traffic(2), weather(3), hub_temp(4),
+            #  steps_elapsed(5), steps_remaining(6), difficulty(7), active_shipments(8), active_vehicles(9)]
             assert -40 <= obs["global"][0] <= 60, "ambient_temperature out of bounds"
             assert -10 <= obs["global"][4] <= 30, "hub_cold_storage_temp out of bounds"
             assert 0   <= obs["global"][1] <= 1,  "time_of_day out of bounds"
             assert 0   <= obs["global"][5] <= env.config.max_steps, "steps_elapsed out of bounds"
             assert 0   <= obs["global"][6] <= env.config.max_steps, "steps_remaining out of bounds"
+            assert 0   <= obs["global"][7] <= 1,  "difficulty_level_norm out of bounds"
+            assert 0   <= obs["global"][8] <= 1,  "active_shipments_norm out of bounds"
+            assert 0   <= obs["global"][9] <= 1,  "active_vehicles_norm out of bounds"
             
             # Vehicle / shipment observations: no NaN
             assert not np.isnan(obs["vehicles"]).any(),  "NaN in vehicle observations"

@@ -17,7 +17,7 @@ from core.city_graph import build_city_graph, detour_cost, nearest_cold_depot, r
 from core.config import ColdChainConfig
 from core.graders import CompositeGrader, DeliverySuccessGrader, EfficiencyGrader, ThermalIntegrityGrader
 from core.models import ColdChainAction, ColdChainObservation, ColdChainState, GlobalTelemetry, ShipmentTelemetry, VehicleTelemetry
-from core.reward import compute_step_reward
+from core.reward import compute_step_reward, partial_delivery_terminal_reward
 from core.shipment import CARGO_SPECS, Shipment, update_temperature
 from core.vehicle import RefrigStatus, Vehicle, VehicleStatus, get_hold_temperature, maybe_breakdown, maybe_degrade_refrigeration, step_dock_timer
 from core.weather import WeatherEvent, WeatherSystem
@@ -49,6 +49,8 @@ class ColdChainEnvironment(Environment):
         self._last_action_type: Optional[int] = None
         self._same_action_streak: int = 0
         self.difficulty = 1
+        self.active_vehicle_count = self.config.n_vehicles
+        self.active_shipment_count = self.config.n_shipments
         self._forced_weather_schedule: Dict[int, tuple[WeatherEvent, int]] = {}
         self._forced_weather_only: bool = False
         self._forced_breakdown_schedule: Dict[int, List[int]] = {}
@@ -72,6 +74,8 @@ class ColdChainEnvironment(Environment):
         self._initial_distances = {}
         self._last_action_type = None
         self._same_action_streak = 0
+        self.active_vehicle_count = self.config.n_vehicles
+        self.active_shipment_count = self.config.n_shipments
         self._forced_weather_schedule = {}
         self._forced_weather_only = bool(kwargs.get("forced_weather_only", False))
         self._forced_breakdown_schedule = {}
@@ -88,6 +92,8 @@ class ColdChainEnvironment(Environment):
         shipment_priorities = kwargs.get("shipment_priorities")
         shipment_deadlines = kwargs.get("shipment_deadlines")
         shipment_assignments = kwargs.get("shipment_assignments")
+        active_vehicle_count = kwargs.get("active_vehicle_count")
+        active_shipment_count = kwargs.get("active_shipment_count")
         forced_weather_events = kwargs.get("forced_weather_events")
         forced_breakdowns = kwargs.get("forced_breakdowns")
         load_shipments_on_start = bool(kwargs.get("load_shipments_on_start", False))
@@ -170,12 +176,15 @@ class ColdChainEnvironment(Environment):
                         vehicle.shipments_onboard.append(shipment.id)
                         shipment.current_vehicle_id = vehicle.id
 
+        self._apply_activity_profile(active_vehicle_count=active_vehicle_count, active_shipment_count=active_shipment_count)
+
         # Curriculum Learning: Teleport vehicle near destination (Fix 1 in Debug.md)
         self.difficulty = kwargs.get("curriculum_difficulty", 3)
         difficulty = self.difficulty
         if difficulty < 3 and not custom_layout:
-            if self.shipments and self.vehicles:
-                shipment = self.shipments[0]
+            active_shipments = self._active_shipments()
+            if active_shipments and self.vehicles and self.active_vehicle_count > 0:
+                shipment = active_shipments[0]
                 vehicle = self.vehicles[0]
                 
                 # Pre-load shipment onto vehicle
@@ -217,6 +226,39 @@ class ColdChainEnvironment(Environment):
         observation = self._get_obs(reward=0.0, done=False, message="ColdChain episode reset", info=self._get_info())
         self._last_info = self._get_info()
         return observation
+
+    def _apply_activity_profile(self, active_vehicle_count: Optional[int], active_shipment_count: Optional[int]) -> None:
+        requested_vehicle_count = self.config.n_vehicles if active_vehicle_count is None else int(active_vehicle_count)
+        requested_shipment_count = self.config.n_shipments if active_shipment_count is None else int(active_shipment_count)
+        self.active_vehicle_count = max(1, min(self.config.n_vehicles, requested_vehicle_count))
+        self.active_shipment_count = max(1, min(self.config.n_shipments, requested_shipment_count))
+
+        for shipment in self.shipments:
+            shipment.is_active = shipment.id < self.active_shipment_count
+            if not shipment.is_active:
+                shipment.current_vehicle_id = -1
+                shipment.is_destroyed = False
+                shipment.is_delivered = True
+                shipment.excursion_count = 0
+                shipment.excursion_duration = 0
+                shipment.steps_since_last_reading = 0
+
+        for vehicle in self.vehicles:
+            if vehicle.id >= self.active_vehicle_count:
+                vehicle.status = VehicleStatus.BROKEN
+                vehicle.route = []
+                vehicle.shipments_onboard = []
+                vehicle.steps_until_next_waypoint = 0
+
+        for vehicle in self.vehicles:
+            vehicle.shipments_onboard = [
+                shipment_id
+                for shipment_id in vehicle.shipments_onboard
+                if shipment_id < len(self.shipments) and self.shipments[shipment_id].is_active
+            ]
+
+    def _active_shipments(self) -> list[Shipment]:
+        return [shipment for shipment in self.shipments if shipment.is_active]
 
     def step(self, action: ColdChainAction, timeout_s=None, **kwargs) -> ColdChainObservation:  # type: ignore[override]
         if self.graph is None:
@@ -271,11 +313,13 @@ class ColdChainEnvironment(Environment):
         self._refresh_vehicle_metrics()
 
         env_state = SimpleNamespace(
-            shipments=self.shipments,
+            shipments=self._active_shipments(),
             vehicles=self.vehicles,
             graph=self.graph,
             steps_elapsed=self.steps_elapsed,
             difficulty=self.difficulty,
+            active_shipment_count=self.active_shipment_count,
+            active_vehicle_count=self.active_vehicle_count,
             _prev_distances=self._prev_distances,
             node_visit_counts=self._node_visit_counts,
             milestones=self.milestones,
@@ -303,17 +347,21 @@ class ColdChainEnvironment(Environment):
 
         if all_destroyed and not all_delivered:
             # Hard-stop failure mode: do not allow "destroy fast" to be a viable shortcut.
-            reward += -30.0 * float(len(self.shipments))
-            info["all_destroyed_terminal_penalty"] = -30.0 * float(len(self.shipments))
+            reward += -30.0 * float(len(self._active_shipments()))
+            info["all_destroyed_terminal_penalty"] = -30.0 * float(len(self._active_shipments()))
 
         # Terminal non-delivery penalty — scaled to avoid drowning dense learning signal.
         if truncated and not terminated:
-            undelivered = [s for s in self.shipments if not s.is_delivered and not s.is_destroyed]
+            undelivered = [s for s in self._active_shipments() if not s.is_delivered and not s.is_destroyed]
             if undelivered:
                 # Terminal penalties never anneal: timeout must remain a hard failure.
                 terminal_penalty = -5.0 * len(undelivered)
                 reward += terminal_penalty
                 info["terminal_penalty"] = terminal_penalty
+                if self.active_shipment_count > 1:
+                    partial_bonus = partial_delivery_terminal_reward(self.shipments)
+                    reward += partial_bonus
+                    info["partial_delivery_terminal_bonus"] = float(partial_bonus)
 
         self._update_visible_temperature_cache()
         curr_locations = tuple(vehicle.location for vehicle in self.vehicles)
@@ -518,7 +566,7 @@ class ColdChainEnvironment(Environment):
         for vehicle in self.vehicles:
             if vehicle.location == 0 and len(vehicle.shipments_onboard) < self.config.max_cargo_per_vehicle:
                 for shipment in self.shipments:
-                    if shipment.current_vehicle_id == -1 and not shipment.is_delivered and not shipment.is_destroyed:
+                    if shipment.is_active and shipment.current_vehicle_id == -1 and not shipment.is_delivered and not shipment.is_destroyed:
                         # Pickup!
                         shipment.current_vehicle_id = vehicle.id
                         vehicle.shipments_onboard.append(shipment.id)
@@ -528,6 +576,8 @@ class ColdChainEnvironment(Environment):
     def _update_shipments(self) -> None:
         hub_temp = 4.0 if self.weather.current_event.name != "POWER_OUTAGE" else self.weather.outdoor_temperature
         for shipment in self.shipments:
+            if not shipment.is_active:
+                continue
             if shipment.is_destroyed or shipment.is_delivered:
                 continue
 
@@ -555,7 +605,8 @@ class ColdChainEnvironment(Environment):
 
     def _cache_visible_temperatures(self) -> None:
         for shipment in self.shipments:
-            self._last_known_temps[shipment.id] = shipment.cargo_temp
+            if shipment.is_active:
+                self._last_known_temps[shipment.id] = shipment.cargo_temp
 
     def _update_visit_counts(self) -> None:
         for vehicle in self.vehicles:
@@ -574,7 +625,7 @@ class ColdChainEnvironment(Environment):
 
     def _update_visible_temperature_cache(self) -> None:
         for shipment in self.shipments:
-            if shipment.steps_since_last_reading == 0:
+            if shipment.is_active and shipment.steps_since_last_reading == 0:
                 self._last_known_temps[shipment.id] = shipment.cargo_temp
 
     def _get_obs(self, reward: float, done: bool, message: str, info: Optional[Dict[str, Any]] = None) -> ColdChainObservation:
@@ -586,6 +637,9 @@ class ColdChainEnvironment(Environment):
             hub_cold_storage_temp=float(4.0 if self.weather.current_event.name != "POWER_OUTAGE" else self.weather.outdoor_temperature),
             steps_elapsed=self.steps_elapsed,
             steps_remaining=max(0, self.config.max_steps - self.steps_elapsed),
+            difficulty_level_norm=float(self.difficulty) / 5.0,
+            active_shipments_norm=float(self.active_shipment_count) / float(max(1, self.config.max_shipments)),
+            active_vehicles_norm=float(self.active_vehicle_count) / float(max(1, self.config.n_vehicles)),
         )
 
         vehicle_rows: list[VehicleTelemetry] = []
@@ -651,9 +705,10 @@ class ColdChainEnvironment(Environment):
         )
 
     def _get_info(self):
-        all_delivered = all(shipment.is_delivered for shipment in self.shipments)
-        all_destroyed = all(shipment.is_destroyed for shipment in self.shipments)
-        any_delivered = any(shipment.is_delivered for shipment in self.shipments)
+        active_shipments = self._active_shipments()
+        all_delivered = all(shipment.is_delivered for shipment in active_shipments)
+        all_destroyed = all(shipment.is_destroyed for shipment in active_shipments)
+        any_delivered = any(shipment.is_delivered for shipment in active_shipments)
         termination_reason = "in_progress"
         if self._state.terminated:
             if all_delivered:
@@ -677,6 +732,8 @@ class ColdChainEnvironment(Environment):
             "transit_no_progress_streak": dict(self._transit_no_progress_streak),
             "delivery_success": bool(all_delivered),
             "delivery_any": bool(any_delivered),
+            "active_vehicle_count": int(self.active_vehicle_count),
+            "active_shipment_count": int(self.active_shipment_count),
             "termination_reason": termination_reason,
             "per_shipment_status": {shipment.id: dataclasses.asdict(shipment) for shipment in self.shipments},
             "per_vehicle_status": {vehicle.id: dataclasses.asdict(vehicle) for vehicle in self.vehicles},
@@ -697,18 +754,19 @@ class ColdChainEnvironment(Environment):
         return {"delivery": delivery, "thermal": thermal, "efficiency": efficiency, "composite": composite}
 
     def _all_shipments_complete(self) -> bool:
-        return all(shipment.is_delivered or shipment.is_destroyed for shipment in self.shipments)
+        return all(shipment.is_delivered or shipment.is_destroyed for shipment in self._active_shipments())
 
     def _all_shipments_delivered(self) -> bool:
-        return all(shipment.is_delivered for shipment in self.shipments)
+        return all(shipment.is_delivered for shipment in self._active_shipments())
 
     def _all_shipments_destroyed(self) -> bool:
-        return all(shipment.is_destroyed for shipment in self.shipments)
+        return all(shipment.is_destroyed for shipment in self._active_shipments())
 
     def _build_episode_summary(self) -> Dict[str, Any]:
+        active_shipments = self._active_shipments()
         return {
             "steps_elapsed": self.steps_elapsed,
-            "shipments_delivered": sum(int(shipment.is_delivered) for shipment in self.shipments),
-            "shipments_destroyed": sum(int(shipment.is_destroyed) for shipment in self.shipments),
+            "shipments_delivered": sum(int(shipment.is_delivered) for shipment in active_shipments),
+            "shipments_destroyed": sum(int(shipment.is_destroyed) for shipment in active_shipments),
             "illegal_actions": self._illegal_action_count,
         }

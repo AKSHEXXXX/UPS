@@ -87,3 +87,54 @@ Interpretation:
 
 Run targeted regression after this reorganization:
 - `PYTHONPATH=. .venv/bin/pytest tests/test_eval_contract.py tests/test_graders.py tests/test_phase11_comprehensive.py -q`
+
+## Latest Update (10 Apr 2026)
+
+1. Phase-3 training/eval pipeline extensions verified and integrated
+- Added phase-3 hard/extreme rollout harvest for imitation data (`harvest_imitation_dataset`) with scenario-family tagging.
+- Added BC warm-start (`run_behavior_cloning_warmstart`) and dataset load path (`_load_imitation_dataset`).
+- Added tier-aligned validation (`run_tier_aligned_validation`) and `TierAlignedMetricsCallback`.
+- Added entropy gating based on extreme stochastic competence in entropy annealing callback.
+- Added CLI controls:
+  - `--disable-bc-warmstart`
+  - `--disable-tier-aligned-validation`
+
+2. Evaluation + curriculum behavior updates completed
+- Eval contract trajectory capture now stores pre-action obs/mask and final info payload.
+- Curriculum wrapper behavior updated so legacy success-promotion is disabled whenever `difficulty_weights` is set.
+- Curriculum sampling now logs sampled `scenario_family` for phase-3 diagnostics.
+
+3. Additional noise-control pass implemented
+- Added explicit difficulty-aware reward normalization in reward computation.
+- Added config knobs:
+  - `enable_difficulty_reward_normalization`
+  - `reward_norm_alpha`
+  - `reward_norm_warmup_steps`
+  - `reward_norm_clip`
+- Enabled normalization by default in phase-3 base config.
+
+4. Test/verification status
+- Added targeted tests in `tests/test_training_redesign.py` for:
+  - `_select_harvest_candidates`
+  - `_classify_failure`
+  - `_load_imitation_dataset`
+  - legacy promotion disabled behavior when `difficulty_weights` is active
+- Grader compatibility fixes added for dict-based trajectory transitions.
+- Verification run:
+  - `py_compile` passed
+  - targeted pytest passed (`15 passed`)
+
+5. Latest short training evidence (phase 3, 20k steps)
+- Run used:
+  - resume from `models/ppo_phase2.zip`
+  - refrigeration reaction enabled
+  - BC warm-start enabled
+  - tier-aligned validation enabled
+  - difficulty-aware reward normalization enabled
+- Outcome summary:
+  - hard tier deterministic delivery: `20%`
+  - extreme tier deterministic delivery: `0%`
+  - robustness gate: not met yet
+- Interpretation:
+  - pipeline is functioning end-to-end
+  - deterministic extreme performance remains the primary bottleneck

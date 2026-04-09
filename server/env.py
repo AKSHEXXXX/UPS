@@ -15,34 +15,63 @@ class CurriculumWrapper(gym.Wrapper):
         self.difficulty = 1
         self.success_count = 0
         self.successes_to_advance = 2
-        self.max_difficulty = 3
+        self.max_difficulty = 5
         self.replay_prob = 0.0
         self.replay_min_difficulty = 1
+        self.difficulty_weights: dict[int, float] | None = None
+        self.scenario_library: dict[int, list[dict[str, Any]]] = {}
         self._rng = np.random.default_rng()
+        self.log_sampling = False
+        self._reset_count = 0
 
     def reset(self, seed=None, options=None):
         if seed is not None:
             self._rng = np.random.default_rng(seed)
 
         options = dict(options or {})
-        effective_difficulty = self.difficulty
-        if self.difficulty > self.replay_min_difficulty and self.replay_prob > 0.0:
+        effective_difficulty = int(self.difficulty)
+
+        if self.difficulty_weights:
+            difficulties = sorted(int(level) for level in self.difficulty_weights)
+            weights = np.asarray([max(0.0, float(self.difficulty_weights[level])) for level in difficulties], dtype=np.float64)
+            if float(weights.sum()) > 0.0:
+                weights = weights / float(weights.sum())
+                effective_difficulty = int(self._rng.choice(difficulties, p=weights))
+        elif self.difficulty > self.replay_min_difficulty and self.replay_prob > 0.0:
             if float(self._rng.random()) < self.replay_prob:
                 low = max(1, int(self.replay_min_difficulty))
                 high = max(low + 1, int(self.difficulty))
                 effective_difficulty = int(self._rng.integers(low, high))
 
+        scenario_options: dict[str, Any] = {}
+        scenario_family = f"difficulty_{effective_difficulty}_default"
+        scenario_candidates = self.scenario_library.get(int(effective_difficulty), [])
+        if scenario_candidates:
+            scenario_index = int(self._rng.integers(0, len(scenario_candidates)))
+            scenario_options = dict(scenario_candidates[scenario_index])
+            scenario_family = str(
+                scenario_options.get("scenario_family", f"difficulty_{effective_difficulty}_variant_{scenario_index}")
+            )
+
+        options.update(scenario_options)
         options["curriculum_difficulty"] = effective_difficulty
         obs, info = self.env.reset(seed=seed, options=options)
         info = dict(info)
         info["curriculum_difficulty"] = int(effective_difficulty)
+        info["scenario_family"] = scenario_family
+        self._reset_count += 1
+        if self.log_sampling and (self._reset_count <= 20 or self._reset_count % 100 == 0):
+            print(
+                f"[CurriculumSample] reset={self._reset_count} difficulty={effective_difficulty} "
+                f"scenario_family={scenario_family}"
+            )
         return obs, info
 
     def step(self, action):
         obs, reward, terminated, truncated, info = self.env.step(action)
         
         # Progress curriculum only on successful terminal delivery outcomes.
-        if terminated and bool(info.get("delivery_success", False)):
+        if not self.difficulty_weights and terminated and bool(info.get("delivery_success", False)):
             self.success_count += 1
             print(f"DEBUG: Success count = {self.success_count}/{self.successes_to_advance} for Difficulty {self.difficulty}")
             if self.success_count >= self.successes_to_advance:
@@ -74,8 +103,8 @@ class ColdChainEnv(gym.Env):
         self.observation_space = gym.spaces.Dict(
             {
                 "global": gym.spaces.Box(
-                    low=np.array([-40.0, 0.0, 1.0, 0.0, -10.0, 0.0, 0.0], dtype=np.float32),
-                    high=np.array([60.0, 1.0, 4.0, 3.0, 30.0, float(cfg.max_steps), float(cfg.max_steps)], dtype=np.float32),
+                    low=np.array([-40.0, 0.0, 1.0, 0.0, -10.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32),
+                    high=np.array([60.0, 1.0, 4.0, 3.0, 30.0, float(cfg.max_steps), float(cfg.max_steps), 1.0, 1.0, 1.0], dtype=np.float32),
                     dtype=np.float32
                 ),
                 "vehicles": gym.spaces.Box(
@@ -218,7 +247,10 @@ class ColdChainEnv(gym.Env):
             float(global_state.get("weather_event", 0)),
             global_state.get("hub_cold_storage_temp", 4.0),
             float(global_state.get("steps_elapsed", 0)),
-            float(global_state.get("steps_remaining", 0))
+            float(global_state.get("steps_remaining", 0)),
+            float(global_state.get("difficulty_level_norm", 0.0)),
+            float(global_state.get("active_shipments_norm", 0.0)),
+            float(global_state.get("active_vehicles_norm", 0.0)),
         ], dtype=np.float32)
 
         vehicle_rows = []

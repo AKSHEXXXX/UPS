@@ -14,6 +14,9 @@ def _sample_observation_payload() -> dict:
             "hub_cold_storage_temp": 4.0,
             "steps_elapsed": 3,
             "steps_remaining": 7,
+            "difficulty_level_norm": 0.8,
+            "active_shipments_norm": 0.625,
+            "active_vehicles_norm": 0.6,
         },
         "vehicles": [
             {
@@ -78,6 +81,7 @@ def test_openenv_client_payload_roundtrip():
     assert result.observation.reward == 1.5
     assert result.observation.last_action_error is None
     assert result.observation.global_state.steps_elapsed == 3
+    assert result.observation.global_state.difficulty_level_norm == 0.8
     assert result.observation.vehicles[0].shipments_onboard == [0, -1]
     assert result.observation.shipments[0].current_vehicle == 0
 

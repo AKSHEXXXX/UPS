@@ -52,6 +52,17 @@ class ColdChainConfig:
     penalty_anneal_steps: int = 30000
     penalty_initial_scale: float = 0.1
 
+    # Optional targeted phase-3 shaping.
+    enable_refrigeration_reaction: bool = False
+    refrigeration_reaction_bonus: float = 0.30
+    refrigeration_reaction_penalty: float = 0.15
+
+    # Optional reward-noise control: normalize rewards per difficulty tier.
+    enable_difficulty_reward_normalization: bool = False
+    reward_norm_alpha: float = 0.01
+    reward_norm_warmup_steps: int = 200
+    reward_norm_clip: float = 5.0
+
 
     def __post_init__(self):
         assert self.n_cold_depots >= 1, "Must have at least one cold depot"

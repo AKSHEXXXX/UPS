@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, Iterable
+from typing import Any, Dict, Iterable
 
 from .base import BaseGrader
 
@@ -13,12 +13,20 @@ def _priority_weight(priority: int) -> float:
     return 1.0
 
 
+def _transition_info(transition: Any) -> Dict:
+    if isinstance(transition, dict):
+        return dict(transition.get("info", {}))
+    if isinstance(transition, (tuple, list)) and len(transition) > 3 and isinstance(transition[3], dict):
+        return dict(transition[3])
+    return {}
+
+
 class DeliverySuccessGrader(BaseGrader):
     def _compute(self) -> float:
         if not self.trajectory:
             return 0.0
 
-        final_info = self.trajectory[-1][3] if len(self.trajectory[-1]) > 3 else {}
+        final_info = _transition_info(self.trajectory[-1])
         shipment_states: Dict[str, Dict] = final_info.get("per_shipment_status", {})
         if not shipment_states:
             return 0.0
@@ -62,7 +70,7 @@ class DeliverySuccessGrader(BaseGrader):
     def _delivery_steps(self) -> dict[int, int]:
         delivered_steps: dict[int, int] = {}
         for step_index, transition in enumerate(self.trajectory):
-            info = transition[3] if len(transition) > 3 else {}
+            info = _transition_info(transition)
             states = info.get("per_shipment_status", {})
             for raw_id, shipment in states.items():
                 shipment_id = int(raw_id)
