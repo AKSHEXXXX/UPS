@@ -53,6 +53,7 @@ def _sample_observation_payload() -> dict:
         "action_mask": [1, 0, 0, 0, 0, 0],
         "action_was_masked": False,
         "illegal_action_count": 2,
+        "last_action_error": None,
         "reward_breakdown": {"r_temp": 0.2, "r_progress": 0.4, "r_cost": -0.1, "r_idle": 0.0},
         "episode_summary": {"steps_elapsed": 3, "shipments_delivered": 0, "shipments_destroyed": 0},
         "grader_scores": {"delivery": 0.0, "thermal": 1.0, "efficiency": 0.8, "composite": 0.44},
@@ -75,6 +76,7 @@ def test_openenv_client_payload_roundtrip():
     assert result.reward == 1.5
     assert result.observation.done is True
     assert result.observation.reward == 1.5
+    assert result.observation.last_action_error is None
     assert result.observation.global_state.steps_elapsed == 3
     assert result.observation.vehicles[0].shipments_onboard == [0, -1]
     assert result.observation.shipments[0].current_vehicle == 0

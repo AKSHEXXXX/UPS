@@ -68,6 +68,7 @@ class ColdChainObservation(Observation):
     action_mask: List[int] = Field(default_factory=list)
     action_was_masked: bool = False
     illegal_action_count: int = 0
+    last_action_error: str | None = None
     reward_breakdown: Dict[str, float] = Field(default_factory=dict)
     episode_summary: Dict[str, Any] = Field(default_factory=dict)
     grader_scores: Dict[str, float] = Field(default_factory=dict)
@@ -79,4 +80,3 @@ class ColdChainState(State):
     terminated: bool = False
     truncated: bool = False
     steps_remaining: int = 0
-

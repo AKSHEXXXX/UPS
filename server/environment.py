@@ -37,6 +37,7 @@ class ColdChainEnvironment(Environment):
         self._episode_done = False
         self._illegal_action_count = 0
         self._last_action_was_masked = False
+        self._last_action_error: str | None = None
         self._last_info: Dict[str, Any] = {}
         self._prev_distances: Dict[tuple[int, int], int] = {}
         self._node_visit_counts: Dict[tuple[int, int], int] = {}
@@ -60,6 +61,7 @@ class ColdChainEnvironment(Environment):
         self._episode_done = False
         self._illegal_action_count = 0
         self._last_action_was_masked = False
+        self._last_action_error = None
         self._last_info = {}
         self._prev_distances = {}
         self._node_visit_counts = {}
@@ -224,16 +226,20 @@ class ColdChainEnvironment(Environment):
         prev_locations = tuple(vehicle.location for vehicle in self.vehicles)
         mask = self.action_masks()
         flat_index = flatten_action(action_payload, self.config)
-        info: Dict[str, Any] = {"action_was_masked": False}
+        info: Dict[str, Any] = {"action_was_masked": False, "last_action_error": None}
 
         if flat_index >= len(mask) or mask[flat_index] == 0:
-            warnings.warn("Illegal action received; forcing WAIT", RuntimeWarning)
+            error_message = "Illegal action received; forcing WAIT"
+            warnings.warn(error_message, RuntimeWarning)
             self._illegal_action_count += 1
             self._last_action_was_masked = True
+            self._last_action_error = error_message
             info["action_was_masked"] = True
+            info["last_action_error"] = error_message
             action_payload = {"vehicle_index": int(action_payload["vehicle_index"]), "action_type": 0, "target_index": 0}
         else:
             self._last_action_was_masked = False
+            self._last_action_error = None
 
         current_action_type = int(action_payload.get("action_type", 0))
         if self._last_action_type is None or current_action_type != self._last_action_type:
@@ -637,6 +643,7 @@ class ColdChainEnvironment(Environment):
             action_mask=action_mask,
             action_was_masked=self._last_action_was_masked,
             illegal_action_count=self._illegal_action_count,
+            last_action_error=info.get("last_action_error"),
             reward_breakdown=info.get("reward_breakdown", {}),
             episode_summary=info.get("episode_summary", {}),
             grader_scores=info.get("grader_scores", {}),
@@ -664,6 +671,7 @@ class ColdChainEnvironment(Environment):
         info = {
             "action_was_masked": self._last_action_was_masked,
             "illegal_action_count": self._illegal_action_count,
+            "last_action_error": self._last_action_error,
             "last_action_type": self._last_action_type,
             "same_action_streak": self._same_action_streak,
             "transit_no_progress_streak": dict(self._transit_no_progress_streak),

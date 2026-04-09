@@ -17,3 +17,17 @@ def test_obs_shape_consistent():
     obs, _ = env.reset(seed=0)
     assert obs["vehicles"].shape == (env.config.n_vehicles, 9 + env.config.max_cargo_per_vehicle)
     assert obs["shipments"].shape == (env.config.max_shipments, 13)
+
+
+def test_illegal_action_exposes_last_action_error():
+    env = ColdChainEnv()
+    env.reset(seed=0)
+
+    obs, reward, terminated, truncated, info = env.step([-1, -1, -1])
+
+    assert isinstance(reward, float)
+    assert isinstance(terminated, bool)
+    assert isinstance(truncated, bool)
+    assert info["action_was_masked"] is True
+    assert info["last_action_error"] == "Illegal action received; forcing WAIT"
+    assert env._core._last_info["last_action_error"] == "Illegal action received; forcing WAIT"

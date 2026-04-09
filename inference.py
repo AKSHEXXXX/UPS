@@ -1,144 +1,399 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
-import statistics
+import re
 import sys
 from pathlib import Path
 from typing import Any
 
-from sb3_contrib import MaskablePPO
+from openai import OpenAI
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from core.graders import run_full_evaluation
+from core.config import ColdChainConfig
+from server.env import ColdChainEnv
 
 
-def _parse_seeds(seeds_text: str) -> list[int]:
-    seeds: list[int] = []
-    for piece in seeds_text.split(","):
-        piece = piece.strip()
-        if not piece:
+API_BASE_URL = os.getenv("API_BASE_URL", "https://api.openai.com/v1")
+MODEL_NAME = os.getenv("MODEL_NAME", "gpt-4.1-mini")
+HF_TOKEN = os.getenv("HF_TOKEN")
+LOCAL_IMAGE_NAME = os.getenv("LOCAL_IMAGE_NAME", "")
+DEFAULT_TASK_NAME = "coldchain-gym"
+DEFAULT_BENCHMARK_NAME = "coldchain-gym"
+DEFAULT_REQUEST_TIMEOUT = float(os.getenv("LLM_REQUEST_TIMEOUT", "20"))
+
+ACTION_NAMES = {
+    0: "WAIT",
+    1: "REROUTE",
+    2: "DIVERT_COLD_DEPOT",
+    3: "SWAP_VEHICLE",
+    4: "EXPEDITE",
+    5: "ABORT",
+}
+
+SYSTEM_PROMPT = """You control a cold-chain delivery environment.
+Return exactly one JSON object with integer fields vehicle_index, action_type, target_index.
+Use only legal actions from the provided candidate_actions list.
+Prioritize, in order:
+1. Deliver active shipments before deadlines.
+2. Reduce temperature excursion risk.
+3. Avoid oscillating between equivalent reroutes.
+4. Use WAIT only when movement would clearly be worse.
+Do not include markdown or any explanatory text."""
+
+
+def _bool_text(value: bool) -> str:
+    return "true" if value else "false"
+
+
+def _fmt_float(value: float) -> str:
+    return f"{float(value):.2f}"
+
+
+def _single_line(value: str) -> str:
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def _format_error(error: str | None) -> str:
+    if error is None or not str(error).strip():
+        return "null"
+    return _single_line(str(error))
+
+
+def _action_to_str(action: dict[str, int]) -> str:
+    action_name = ACTION_NAMES.get(action["action_type"], "UNKNOWN")
+    return (
+        f"vehicle_index={action['vehicle_index']},"
+        f"action_type={action['action_type']}:{action_name},"
+        f"target_index={action['target_index']}"
+    )
+
+
+def _legal_actions(mask: list[int], config: ColdChainConfig) -> list[dict[str, int]]:
+    n_nodes = config.n_nodes
+    actions: list[dict[str, int]] = []
+    for flat_index, enabled in enumerate(mask):
+        if not enabled:
             continue
-        seeds.append(int(piece))
-    if not seeds:
-        raise ValueError("At least one seed is required")
-    return seeds
+        vehicle_index = flat_index // (6 * n_nodes)
+        action_type = (flat_index % (6 * n_nodes)) // n_nodes
+        target_index = flat_index % n_nodes
+        actions.append(
+            {
+                "vehicle_index": int(vehicle_index),
+                "action_type": int(action_type),
+                "target_index": int(target_index),
+            }
+        )
+    return actions
 
 
-def _row_by_tier(rows: list[dict[str, Any]], tier: str) -> dict[str, Any]:
-    for row in rows:
-        if str(row.get("tier", "")).lower() == tier.lower():
-            return row
-    return {}
+def _candidate_action_summary(legal_actions: list[dict[str, int]], max_items: int = 24) -> list[dict[str, int | str]]:
+    summary: list[dict[str, int | str]] = []
+    for action in legal_actions[:max_items]:
+        summary.append(
+            {
+                "vehicle_index": action["vehicle_index"],
+                "action_type": action["action_type"],
+                "action_name": ACTION_NAMES.get(action["action_type"], "UNKNOWN"),
+                "target_index": action["target_index"],
+            }
+        )
+    return summary
 
 
-def _score_digest(payload: dict[str, Any]) -> str:
-    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+def _shipment_risk(shipment: dict[str, Any]) -> float:
+    temp = float(shipment.get("cargo_temp", 0.0))
+    low = float(shipment.get("temp_lower_bound", 0.0))
+    high = float(shipment.get("temp_upper_bound", 0.0))
+    deadline = float(shipment.get("time_to_deadline", 9999))
+    excursion_count = float(shipment.get("excursion_count", 0.0))
+    excursion_duration = float(shipment.get("excursion_duration", 0.0))
+    destroyed = int(shipment.get("is_destroyed", 0))
+    delivered = int(shipment.get("is_delivered", 0))
+    if destroyed or delivered:
+        return -1e9
+
+    temperature_penalty = 0.0
+    if temp < low:
+        temperature_penalty += (low - temp) * 25.0
+    if temp > high:
+        temperature_penalty += (temp - high) * 25.0
+
+    margin_penalty = 0.0
+    margin_penalty += max(0.0, 1.0 - (temp - low)) * 3.0
+    margin_penalty += max(0.0, 1.0 - (high - temp)) * 3.0
+
+    urgency_bonus = max(0.0, 50.0 - deadline)
+    return urgency_bonus + temperature_penalty + margin_penalty + excursion_count * 10.0 + excursion_duration * 2.0
 
 
-def _mean(values: list[float]) -> float:
-    return float(sum(values) / max(1, len(values)))
+def _priority_shipment(observation: dict[str, Any]) -> dict[str, Any] | None:
+    shipments = observation.get("shipments", [])
+    active = [shipment for shipment in shipments if not int(shipment.get("is_delivered", 0)) and not int(shipment.get("is_destroyed", 0))]
+    if not active:
+        return None
+    return max(active, key=_shipment_risk)
+
+
+def _vehicle_by_id(observation: dict[str, Any], vehicle_id: int) -> dict[str, Any] | None:
+    for vehicle in observation.get("vehicles", []):
+        if int(vehicle.get("id", -1)) == int(vehicle_id):
+            return vehicle
+    return None
+
+
+def _shipment_by_id(observation: dict[str, Any], shipment_id: int) -> dict[str, Any] | None:
+    for shipment in observation.get("shipments", []):
+        if int(shipment.get("id", -1)) == int(shipment_id):
+            return shipment
+    return None
+
+
+def _action_score(action: dict[str, int], observation: dict[str, Any], config: ColdChainConfig) -> float:
+    vehicle_index = int(action["vehicle_index"])
+    action_type = int(action["action_type"])
+    target_index = int(action["target_index"])
+    global_noop_vehicle = int(config.n_vehicles)
+
+    if vehicle_index == global_noop_vehicle:
+        return -25.0
+
+    vehicle = _vehicle_by_id(observation, vehicle_index)
+    if vehicle is None:
+        return -1e9
+
+    score = 0.0
+    onboard_ids = [int(shipment_id) for shipment_id in vehicle.get("shipments_onboard", []) if int(shipment_id) >= 0]
+    onboard_shipments = [shipment for shipment_id in onboard_ids if (shipment := _shipment_by_id(observation, shipment_id)) is not None]
+    urgent_onboard = max((_shipment_risk(shipment) for shipment in onboard_shipments), default=-1e9)
+    priority = _priority_shipment(observation)
+
+    if action_type == 0:
+        score -= 4.0
+        if vehicle.get("status") == 2:
+            score -= 2.0
+    elif action_type == 1:
+        score += 1.0
+        if onboard_shipments:
+            primary = max(onboard_shipments, key=_shipment_risk)
+            destination = int(primary.get("destination_node", 0))
+            if target_index == destination:
+                score += 20.0
+            else:
+                score -= 6.0
+        elif priority is not None:
+            if target_index == int(priority.get("destination_node", 0)):
+                score += 8.0
+        steps_to_destination = float(vehicle.get("steps_to_destination", 9999))
+        if target_index == int(vehicle.get("location", -1)):
+            score -= 12.0
+        score += max(0.0, 12.0 - min(12.0, steps_to_destination)) * 0.5
+    elif action_type == 2:
+        score += 10.0 if urgent_onboard > 0 else -8.0
+        if target_index == int(vehicle.get("nearest_cold_depot_node", -1)):
+            score += 8.0
+    elif action_type == 3:
+        score += 2.0 if onboard_shipments else -5.0
+    elif action_type == 4:
+        in_transit = int(vehicle.get("status", -1)) == 1
+        score += 6.0 if in_transit else -10.0
+        if urgent_onboard > 0:
+            score += 6.0
+    elif action_type == 5:
+        score += 3.0 if urgent_onboard > 20.0 else -20.0
+
+    if priority is not None and onboard_shipments:
+        if any(int(shipment.get("id", -1)) == int(priority.get("id", -2)) for shipment in onboard_shipments):
+            score += 6.0
+
+    return score
+
+
+def _ranked_actions(legal_actions: list[dict[str, int]], observation: dict[str, Any], config: ColdChainConfig, limit: int = 12) -> list[dict[str, int]]:
+    ranked = sorted(
+        legal_actions,
+        key=lambda action: (_action_score(action, observation, config), -action["vehicle_index"], -action["action_type"]),
+        reverse=True,
+    )
+    return ranked[:limit]
+
+
+def _build_prompt(observation: dict[str, Any], candidate_actions: list[dict[str, int]], task_name: str) -> str:
+    vehicles = observation.get("vehicles", [])
+    shipments = observation.get("shipments", [])
+    global_state = observation.get("global_state", {})
+    priority = _priority_shipment(observation)
+
+    prompt_payload = {
+        "task": task_name,
+        "global_state": global_state,
+        "vehicles": vehicles,
+        "shipments": shipments,
+        "legal_action_count": len(candidate_actions),
+        "priority_shipment": priority,
+        "candidate_actions": _candidate_action_summary(candidate_actions),
+        "instructions": "Choose exactly one action from candidate_actions. Prefer the priority shipment and avoid route thrashing.",
+    }
+    return json.dumps(prompt_payload, separators=(",", ":"))
+
+
+def _extract_action(response_text: str) -> dict[str, int]:
+    payload = json.loads(response_text)
+    return {
+        "vehicle_index": int(payload["vehicle_index"]),
+        "action_type": int(payload["action_type"]),
+        "target_index": int(payload["target_index"]),
+    }
+
+
+def _choose_fallback_action(candidate_actions: list[dict[str, int]], observation: dict[str, Any], config: ColdChainConfig) -> dict[str, int]:
+    ranked = _ranked_actions(candidate_actions, observation, config, limit=1)
+    if ranked:
+        return ranked[0]
+    return {"vehicle_index": int(config.n_vehicles), "action_type": 0, "target_index": 0}
+
+
+def _request_action(
+    client: OpenAI,
+    model_name: str,
+    observation: dict[str, Any],
+    candidate_actions: list[dict[str, int]],
+    task_name: str,
+    benchmark_name: str,
+    request_timeout: float,
+) -> dict[str, int]:
+    prompt = _build_prompt(observation, candidate_actions, task_name)
+    completion = client.chat.completions.create(
+        model=model_name,
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": (
+                    f"benchmark={benchmark_name}\n"
+                    f"Return only JSON.\n"
+                    f"{prompt}"
+                ),
+            },
+        ],
+        temperature=0,
+        timeout=request_timeout,
+    )
+    content = completion.choices[0].message.content or ""
+    return _extract_action(content)
+
+
+def _validate_action(action: dict[str, int], candidate_actions: list[dict[str, int]]) -> bool:
+    return action in candidate_actions
+
+
+def _build_client() -> OpenAI:
+    if not HF_TOKEN:
+        raise ValueError("HF_TOKEN must be defined")
+    if API_BASE_URL.startswith("<") or MODEL_NAME.startswith("<"):
+        raise ValueError("API_BASE_URL and MODEL_NAME must be configured for LLM inference")
+    return OpenAI(base_url=API_BASE_URL, api_key=HF_TOKEN)
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="LLM-driven inference for coldchain-gym")
+    parser.add_argument("--task-name", type=str, default=DEFAULT_TASK_NAME)
+    parser.add_argument("--benchmark", type=str, default=DEFAULT_BENCHMARK_NAME)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--max-steps", type=int, default=20)
+    parser.add_argument("--request-timeout", type=float, default=DEFAULT_REQUEST_TIMEOUT)
+    return parser.parse_args()
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Deterministic inference with reproducible tier scores")
-    parser.add_argument("--model-path", type=str, default="models/ppo_phase3.zip")
-    parser.add_argument("--seeds", type=str, default="42,101,202,303,404")
-    parser.add_argument("--eval-training-step", type=int, default=50000)
-    parser.add_argument("--trace-every", type=int, default=0)
-    parser.add_argument("--output-json", type=str, default="")
-    args = parser.parse_args()
+    args = _parse_args()
+    config = ColdChainConfig(max_steps=int(args.max_steps))
+    env = ColdChainEnv(config=config)
+    rewards: list[float] = []
+    success = False
+    steps = 0
+    end_score = 0.0
+    start_emitted = False
 
-    if not os.path.exists(args.model_path):
-        raise FileNotFoundError(f"Model not found: {args.model_path}")
+    try:
+        client = _build_client()
+        print(f"[START] task={args.task_name} env={args.benchmark} model={MODEL_NAME}", flush=True)
+        start_emitted = True
 
-    seeds = _parse_seeds(args.seeds)
-    model = MaskablePPO.load(args.model_path)
+        obs, info = env.reset(seed=int(args.seed))
+        done = False
 
-    per_seed: list[dict[str, Any]] = []
+        while not done:
+            observation = env._core._get_obs(reward=0.0, done=False, message="llm planning", info=info).model_dump()
+            legal_actions = _legal_actions(observation.get("action_mask", []), config)
+            if not legal_actions:
+                raise RuntimeError("No legal actions available")
+            candidate_actions = _ranked_actions(legal_actions, observation, config)
 
-    print("=" * 78)
-    print("REPRODUCIBLE INFERENCE REPORT")
-    print("=" * 78)
-    print(f"model           : {args.model_path}")
-    print(f"deterministic   : True")
-    print(f"eval_step       : {args.eval_training_step}")
-    print(f"seeds           : {seeds}")
+            action_error: str | None = None
+            try:
+                action = _request_action(
+                    client=client,
+                    model_name=MODEL_NAME,
+                    observation=observation,
+                    candidate_actions=candidate_actions,
+                    task_name=args.task_name,
+                    benchmark_name=args.benchmark,
+                    request_timeout=float(args.request_timeout),
+                )
+            except Exception as exc:
+                action_error = str(exc)
+                action = _choose_fallback_action(candidate_actions, observation, config)
 
-    for seed in seeds:
-        report = run_full_evaluation(
-            model,
-            seed=seed,
-            deterministic=True,
-            evaluation_training_step=int(args.eval_training_step),
-            trace_every=int(args.trace_every),
-        )
-        rows = report.get("rows", [])
+            if not _validate_action(action, candidate_actions):
+                if action_error is None:
+                    action_error = "Model produced an illegal action; replaced with fallback"
+                action = _choose_fallback_action(candidate_actions, observation, config)
 
-        easy = float(_row_by_tier(rows, "easy").get("score", 0.0))
-        moderate = float(_row_by_tier(rows, "moderate").get("score", 0.0))
-        hard = float(_row_by_tier(rows, "hard").get("score", 0.0))
-        extreme = float(_row_by_tier(rows, "extreme").get("score", 0.0))
-        overall = _mean([easy, moderate, hard, extreme])
+            obs, reward, terminated, truncated, info = env.step(
+                [action["vehicle_index"], action["action_type"], action["target_index"]]
+            )
+            done = bool(terminated or truncated)
+            steps += 1
+            rewards.append(float(reward))
 
-        seed_result = {
-            "seed": int(seed),
-            "easy": easy,
-            "moderate": moderate,
-            "hard": hard,
-            "extreme": extreme,
-            "overall": overall,
-            "stopped_early": bool(report.get("stopped_early", False)),
-            "rows": rows,
-        }
-        seed_result["digest"] = _score_digest(seed_result)
-        per_seed.append(seed_result)
+            env_error = info.get("last_action_error")
 
+            print(
+                "[STEP] "
+                f"step={steps} "
+                f"action={_action_to_str(action)} "
+                f"reward={_fmt_float(reward)} "
+                f"done={_bool_text(done)} "
+                f"error={_format_error(env_error)}"
+                ,
+                flush=True,
+            )
+
+        grader_scores = info.get("grader_scores", {})
+        raw_score = grader_scores.get("composite", 1.0 if info.get("delivery_success") else 0.0)
+        end_score = max(0.0, min(1.0, float(raw_score)))
+        success = bool(info.get("delivery_success", False))
+    except Exception:
+        success = False
+    finally:
+        env.close()
+        if not start_emitted:
+            print(f"[START] task={args.task_name} env={args.benchmark} model={MODEL_NAME}", flush=True)
+        reward_text = ",".join(_fmt_float(reward) for reward in rewards)
         print(
-            f"seed={seed:4d} | easy={easy:.4f} moderate={moderate:.4f} "
-            f"hard={hard:.4f} extreme={extreme:.4f} overall={overall:.4f} "
-            f"digest={seed_result['digest']}"
+            "[END] "
+            f"success={_bool_text(success)} "
+            f"steps={steps} "
+            f"score={_fmt_float(end_score)} "
+            f"rewards={reward_text}",
+            flush=True,
         )
-
-    summary = {
-        "easy_mean": _mean([x["easy"] for x in per_seed]),
-        "moderate_mean": _mean([x["moderate"] for x in per_seed]),
-        "hard_mean": _mean([x["hard"] for x in per_seed]),
-        "extreme_mean": _mean([x["extreme"] for x in per_seed]),
-        "overall_mean": _mean([x["overall"] for x in per_seed]),
-        "overall_stdev": float(statistics.pstdev([x["overall"] for x in per_seed])) if len(per_seed) > 1 else 0.0,
-    }
-    summary["digest"] = _score_digest(summary)
-
-    print("-" * 78)
-    print(
-        f"mean | easy={summary['easy_mean']:.4f} moderate={summary['moderate_mean']:.4f} "
-        f"hard={summary['hard_mean']:.4f} extreme={summary['extreme_mean']:.4f} "
-        f"overall={summary['overall_mean']:.4f} stdev={summary['overall_stdev']:.4f} "
-        f"digest={summary['digest']}"
-    )
-    print("=" * 78)
-
-    payload = {
-        "model_path": args.model_path,
-        "deterministic": True,
-        "eval_training_step": int(args.eval_training_step),
-        "seeds": seeds,
-        "summary": summary,
-        "per_seed": per_seed,
-    }
-
-    if args.output_json:
-        output_path = Path(args.output_json)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        print(f"Wrote JSON report: {output_path}")
 
 
 if __name__ == "__main__":

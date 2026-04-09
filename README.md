@@ -103,6 +103,23 @@ source .venv/bin/activate
 pip install -e .
 ```
 
+### Environment configuration
+
+Create a local `.env` file from `.env.example` and set the required values:
+
+```bash
+cp .env.example .env
+```
+
+Required variables for the LLM-driven `inference.py`:
+
+- `API_BASE_URL=https://api.openai.com/v1`
+- `MODEL_NAME=gpt-4.1-mini`
+- `HF_TOKEN=<your-rotated-openai-api-key>`
+- `LOCAL_IMAGE_NAME=` only if using `from_docker_image()`
+
+Do not commit live API keys. `.env` is already ignored by git.
+
 ## Quick Start
 
 ### 1) Train
