@@ -115,10 +115,12 @@ Required variables for the LLM-driven `inference.py`:
 
 - `API_BASE_URL=https://api.openai.com/v1`
 - `MODEL_NAME=gpt-4.1-mini`
-- `HF_TOKEN=<your-rotated-openai-api-key>`
+- One of: `HF_TOKEN`, `OPENAI_API_KEY`, or `OPENAI_TOKEN`
 - `LOCAL_IMAGE_NAME=` only if using `from_docker_image()`
 
-Do not commit live API keys. `.env` is already ignored by git.
+`inference.py` auto-loads `.env` from the project root (if available).
+
+Do not commit live API keys. `.env` is already ignored by git; use GitHub/CI secrets for hosted runs.
 
 ## Quick Start
 
@@ -138,17 +140,23 @@ python graders/basic_grader_eval.py \
   --deterministic
 ```
 
-### 3) Reproducible inference report
+### 3) LLM/heuristic inference run
 
 ```bash
 python inference.py \
-  --model-path models/ppo_phase3.zip \
-  --seeds 42,101,202,303,404 \
-  --eval-training-step 50000 \
-  --output-json outputs/inference_repro.json
+  --seed 42 \
+  --max-steps 220 \
+  --request-timeout 20
 ```
 
-This script prints per-seed tier scores, aggregate statistics, and reproducibility digests.
+This script prints step-by-step actions and a final score line with:
+
+- `success`
+- `termination_reason`
+- `score`
+- `delivery_score`, `thermal_score`, `efficiency_score`
+
+If no valid API key is found, it automatically falls back to the heuristic policy.
 
 ### 4) Run the OpenEnv server
 

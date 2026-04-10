@@ -69,6 +69,7 @@ dmypy.json
 outputs/
 log_outputs/
 artifacts/generated/
+artifacts/phase4/
 *.log
 phase*_smoke*.log
 phase*_norm*.log
