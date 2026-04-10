@@ -10,9 +10,17 @@ from typing import Any
 
 from openai import OpenAI
 
+try:
+    from dotenv import load_dotenv
+except ImportError:  # pragma: no cover - optional local convenience dependency
+    load_dotenv = None
+
 PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+
+if load_dotenv is not None:
+    load_dotenv(PROJECT_ROOT / ".env")
 
 from core.config import ColdChainConfig
 from server.env import ColdChainEnv
@@ -20,7 +28,7 @@ from server.env import ColdChainEnv
 
 API_BASE_URL = os.getenv("API_BASE_URL", "https://api.openai.com/v1")
 MODEL_NAME = os.getenv("MODEL_NAME", "gpt-4.1-mini")
-HF_TOKEN = os.getenv("HF_TOKEN")
+API_KEY = os.getenv("HF_TOKEN") or os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_TOKEN")
 LOCAL_IMAGE_NAME = os.getenv("LOCAL_IMAGE_NAME", "")
 DEFAULT_TASK_NAME = "coldchain-gym"
 DEFAULT_BENCHMARK_NAME = "coldchain-gym"
@@ -293,11 +301,11 @@ def _validate_action(action: dict[str, int], candidate_actions: list[dict[str, i
 
 
 def _build_client() -> OpenAI:
-    if not HF_TOKEN:
-        raise ValueError("HF_TOKEN must be defined")
+    if not API_KEY:
+        raise ValueError("Set HF_TOKEN, OPENAI_API_KEY, or OPENAI_TOKEN in .env")
     if API_BASE_URL.startswith("<") or MODEL_NAME.startswith("<"):
         raise ValueError("API_BASE_URL and MODEL_NAME must be configured for LLM inference")
-    return OpenAI(base_url=API_BASE_URL, api_key=HF_TOKEN)
+    return OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -319,11 +327,22 @@ def main() -> None:
     steps = 0
     end_score = 0.0
     start_emitted = False
+    info: dict[str, Any] = {}
+    grader_scores: dict[str, Any] = {}
+    termination_reason = "unknown"
+    client: OpenAI | None = None
+    client_error: str | None = None
 
     try:
-        client = _build_client()
+        try:
+            client = _build_client()
+        except Exception as exc:
+            client = None
+            client_error = str(exc)
         print(f"[START] task={args.task_name} env={args.benchmark} model={MODEL_NAME}", flush=True)
         start_emitted = True
+        if client is None:
+            print(f"[INFO] LLM client unavailable, using heuristic fallback policy ({_single_line(client_error or 'unknown error')})", flush=True)
 
         obs, info = env.reset(seed=int(args.seed))
         done = False
@@ -336,18 +355,21 @@ def main() -> None:
             candidate_actions = _ranked_actions(legal_actions, observation, config)
 
             action_error: str | None = None
-            try:
-                action = _request_action(
-                    client=client,
-                    model_name=MODEL_NAME,
-                    observation=observation,
-                    candidate_actions=candidate_actions,
-                    task_name=args.task_name,
-                    benchmark_name=args.benchmark,
-                    request_timeout=float(args.request_timeout),
-                )
-            except Exception as exc:
-                action_error = str(exc)
+            if client is not None:
+                try:
+                    action = _request_action(
+                        client=client,
+                        model_name=MODEL_NAME,
+                        observation=observation,
+                        candidate_actions=candidate_actions,
+                        task_name=args.task_name,
+                        benchmark_name=args.benchmark,
+                        request_timeout=float(args.request_timeout),
+                    )
+                except Exception as exc:
+                    action_error = str(exc)
+                    action = _choose_fallback_action(candidate_actions, observation, config)
+            else:
                 action = _choose_fallback_action(candidate_actions, observation, config)
 
             if not _validate_action(action, candidate_actions):
@@ -379,6 +401,7 @@ def main() -> None:
         raw_score = grader_scores.get("composite", 1.0 if info.get("delivery_success") else 0.0)
         end_score = max(0.0, min(1.0, float(raw_score)))
         success = bool(info.get("delivery_success", False))
+        termination_reason = str(info.get("termination_reason", "unknown"))
     except Exception:
         success = False
     finally:
@@ -390,7 +413,11 @@ def main() -> None:
             "[END] "
             f"success={_bool_text(success)} "
             f"steps={steps} "
+            f"termination_reason={termination_reason} "
             f"score={_fmt_float(end_score)} "
+            f"delivery_score={_fmt_float(float(grader_scores.get('delivery', 0.0)))} "
+            f"thermal_score={_fmt_float(float(grader_scores.get('thermal', 0.0)))} "
+            f"efficiency_score={_fmt_float(float(grader_scores.get('efficiency', 0.0)))} "
             f"rewards={reward_text}",
             flush=True,
         )
