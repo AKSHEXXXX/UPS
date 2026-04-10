@@ -34,6 +34,7 @@ DEFAULT_TASK_NAME = "coldchain-gym"
 DEFAULT_BENCHMARK_NAME = "coldchain-gym"
 DEFAULT_REQUEST_TIMEOUT = float(os.getenv("LLM_REQUEST_TIMEOUT", "20"))
 DEFAULT_TASK_SEQUENCE = ["easy", "moderate", "hard", "extreme"]
+LOOP_REPEAT_THRESHOLD = 12
 
 ACTION_NAMES = {
     0: "WAIT",
@@ -367,6 +368,8 @@ def main() -> None:
             obs, info = env.reset(seed=int(args.seed) + task_index, options={"task": task_id})
             done = False
             task_steps = 0
+            repeated_signature_count = 0
+            previous_signature: tuple[Any, ...] | None = None
 
             while not done and task_steps < int(args.max_steps) and steps < total_step_budget:
                 observation = env._core._get_obs(reward=0.0, done=False, message="llm planning", info=info).model_dump()
@@ -406,6 +409,32 @@ def main() -> None:
                 task_steps += 1
                 rewards.append(float(reward))
 
+                # Detect stuck simulation loops (same state/action pattern repeated).
+                vehicles = tuple(
+                    (int(v.get("id", -1)), int(v.get("location", -1)), int(v.get("status", -1)))
+                    for v in observation.get("vehicles", [])
+                )
+                shipments = tuple(
+                    (int(s.get("id", -1)), int(s.get("is_delivered", 0)), int(s.get("is_destroyed", 0)))
+                    for s in observation.get("shipments", [])
+                )
+                action_sig = (
+                    int(action["vehicle_index"]),
+                    int(action["action_type"]),
+                    int(action["target_index"]),
+                )
+                signature = (vehicles, shipments, action_sig)
+                if signature == previous_signature:
+                    repeated_signature_count += 1
+                else:
+                    repeated_signature_count = 0
+                    previous_signature = signature
+
+                if repeated_signature_count >= LOOP_REPEAT_THRESHOLD:
+                    info = dict(info)
+                    info["termination_reason"] = "loop_detected"
+                    done = True
+
                 env_error = info.get("last_action_error")
                 print(
                     "[STEP] "
@@ -417,6 +446,14 @@ def main() -> None:
                     f"error={_format_error(env_error)}",
                     flush=True,
                 )
+
+                # Explicit break boundaries before switching to the next task.
+                if done:
+                    break
+                if task_steps >= int(args.max_steps):
+                    break
+                if steps >= total_step_budget:
+                    break
 
             grader_scores = dict(info.get("grader_scores", {}))
             task_score = float(info.get("task_reward", grader_scores.get(task_id, grader_scores.get("composite", 0.0))))
