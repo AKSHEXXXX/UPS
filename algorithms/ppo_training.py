@@ -1,6 +1,7 @@
 import os
 import argparse
 import sys
+import json
 from pathlib import Path
 from collections import Counter
 from dataclasses import replace
@@ -23,7 +24,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from server.env import ColdChainEnv, CurriculumWrapper
 from core.config import ColdChainConfig
 from evaluation.eval_contract import build_eval_env, run_eval_episode
-from core.graders import run_full_evaluation
+from core.graders import CompositeGrader, DeliverySuccessGrader, run_full_evaluation
 
 
 def _ensure_gym_version_for_sb3() -> None:
@@ -70,13 +71,20 @@ def _phase_ppo_hyperparams(phase: int) -> dict[str, float | int]:
         "n_steps": 512,
         "batch_size": 128,
         "n_epochs": 12,
-        "ent_coef_start": 0.02,
-        "ent_coef_end": 0.005,
+        "ent_coef_start": 0.01,
+        "ent_coef_end": 0.001,
         "vf_coef": 0.6,
         "gamma": 0.997,
         "gae_lambda": 0.97,
         "clip_range": 0.15,
     }
+
+
+def _is_phase3_continuation(phase: int, resume_path: str | None) -> bool:
+    if int(phase) != 3 or not resume_path:
+        return False
+    filename = os.path.basename(str(resume_path)).lower()
+    return "ppo_phase3" in filename
 
 
 def _apply_loaded_ppo_hyperparams(model: MaskablePPO, hyperparams: dict[str, float | int]) -> None:
@@ -225,6 +233,11 @@ def _phase3_ramped_weights(progress: float) -> dict[int, float]:
     values = start + (end - start) * t
     values = values / float(values.sum())
     return {index + 1: float(values[index]) for index in range(5)}
+
+
+def _phase3_focus_extreme_weights() -> dict[int, float]:
+    # Deterministic-alignment continuation pass: maximize hard/extreme exposure.
+    return {1: 0.0, 2: 0.0, 3: 0.0, 4: 0.20, 5: 0.80}
 
 
 class CurriculumRampCallback(BaseCallback):
@@ -585,6 +598,8 @@ def _base_training_space_config(phase: int) -> ColdChainConfig:
             penalty_anneal_steps=60000,
             penalty_initial_scale=0.15,
             enable_difficulty_reward_normalization=True,
+            refrigeration_reaction_bonus=0.45,
+            refrigeration_reaction_penalty=0.22,
         )
     return ColdChainConfig(**config_kwargs)
 
@@ -908,11 +923,14 @@ def harvest_imitation_dataset(
     seed: int,
     episodes_per_scenario: int = 4,
     top_percentile: float = 0.35,
+    extreme_focus: bool = False,
     artifact_path: str | None = None,
 ) -> dict[str, Any]:
     eval_step = max(int(model.num_timesteps), int(config.penalty_anneal_steps))
     library = _training_scenario_library()
     tier_weights = {4: 1.0, 5: 1.75}
+    if bool(extreme_focus):
+        tier_weights = {4: 0.7, 5: 3.0}
     selected_results: dict[int, list[dict[str, Any]]] = {4: [], 5: []}
 
     for difficulty in (4, 5):
@@ -1088,6 +1106,367 @@ def _dataset_rank_summary(dataset: dict[str, Any]) -> dict[str, float]:
         "top1": float(np.mean(ranks == 1)),
         "top2": float(np.mean(ranks == 2)),
         "lower": float(np.mean(ranks > 2)),
+    }
+
+
+def _flat_action_index(vehicle_index: int, action_type: int, target_index: int, n_nodes: int) -> int:
+    return int(vehicle_index) * (6 * int(n_nodes)) + int(action_type) * int(n_nodes) + int(target_index)
+
+
+def _decode_action_type(action_index: int, n_nodes: int) -> int:
+    return int((int(action_index) % (6 * int(n_nodes))) // int(n_nodes))
+
+
+def _status_lookup(status_map: dict[str, Any], key: int) -> dict[str, Any]:
+    if not isinstance(status_map, dict):
+        return {}
+    if key in status_map:
+        return dict(status_map[key])
+    key_str = str(int(key))
+    if key_str in status_map:
+        return dict(status_map[key_str])
+    return {}
+
+
+def _first_valid_action(mask: np.ndarray) -> int:
+    valid = np.flatnonzero(mask)
+    return int(valid[0]) if len(valid) else 0
+
+
+def _greedy_expert_flat_action(raw_env, mask: np.ndarray) -> int:
+    cfg = raw_env.config
+    n_nodes = int(cfg.n_nodes)
+    depot_nodes = list(getattr(raw_env.graph, "graph", {}).get("cold_depot_nodes", [])) if raw_env.graph is not None else []
+
+    for vehicle in raw_env.vehicles:
+        if not bool(getattr(vehicle, "is_active", True)):
+            continue
+        status_value = int(getattr(getattr(vehicle, "status", 0), "value", getattr(vehicle, "status", 0)))
+        if status_value == 3:
+            continue
+
+        onboard = [int(sid) for sid in getattr(vehicle, "shipments_onboard", []) if int(sid) >= 0]
+        refrig_value = int(getattr(getattr(vehicle, "refrig_status", 0), "value", getattr(vehicle, "refrig_status", 0)))
+        nearest_depot = int(getattr(vehicle, "nearest_cold_depot_node", depot_nodes[0] if depot_nodes else 0))
+        detour_cost = float(getattr(vehicle, "detour_cost_to_depot", 9999.0))
+
+        # Rule 1: failed refrigeration + active cargo onboard => divert now.
+        if refrig_value == 2 and onboard:
+            candidate = _flat_action_index(vehicle.id, 2, nearest_depot, n_nodes)
+            if candidate < len(mask) and int(mask[candidate]) == 1:
+                return candidate
+
+        # Rule 2: degraded refrigeration and cheap diversion => divert.
+        if refrig_value == 1 and onboard and detour_cost < 8.0:
+            candidate = _flat_action_index(vehicle.id, 2, nearest_depot, n_nodes)
+            if candidate < len(mask) and int(mask[candidate]) == 1:
+                return candidate
+
+        # Rule 3: deadline pressure => expedite when possible else reroute direct.
+        for shipment_id in onboard:
+            if shipment_id >= len(raw_env.shipments):
+                continue
+            shipment = raw_env.shipments[shipment_id]
+            if bool(getattr(shipment, "is_delivered", False)) or bool(getattr(shipment, "is_destroyed", False)):
+                continue
+            if float(getattr(shipment, "time_to_deadline", 9999)) < 10.0:
+                expedite = _flat_action_index(vehicle.id, 4, 0, n_nodes)
+                if expedite < len(mask) and int(mask[expedite]) == 1:
+                    return expedite
+                reroute = _flat_action_index(vehicle.id, 1, int(getattr(shipment, "destination_node", 0)), n_nodes)
+                if reroute < len(mask) and int(mask[reroute]) == 1:
+                    return reroute
+
+        # Rule 4: idle vehicle with pending shipments => reroute to highest priority destination.
+        if status_value == 0:
+            undelivered = [
+                s
+                for s in raw_env.shipments
+                if bool(getattr(s, "is_active", True))
+                and not bool(getattr(s, "is_delivered", False))
+                and not bool(getattr(s, "is_destroyed", False))
+            ]
+            if undelivered:
+                target = max(undelivered, key=lambda s: int(getattr(s, "priority", 0)))
+                reroute = _flat_action_index(vehicle.id, 1, int(getattr(target, "destination_node", 0)), n_nodes)
+                if reroute < len(mask) and int(mask[reroute]) == 1:
+                    return reroute
+
+    # Rule 5: default wait/no-op.
+    wait_noop = _flat_action_index(cfg.n_vehicles, 0, 0, n_nodes)
+    if wait_noop < len(mask) and int(mask[wait_noop]) == 1:
+        return wait_noop
+    return _first_valid_action(mask)
+
+
+def harvest_expert_trajectories(
+    config: ColdChainConfig,
+    *,
+    seed: int,
+    n_episodes: int = 500,
+    min_delivery_score: float = 0.40,
+) -> dict[str, Any]:
+    library = _training_scenario_library()
+    all_scores: list[float] = []
+    kept_results: list[dict[str, Any]] = []
+
+    for episode_index in range(max(int(n_episodes), 1)):
+        eval_env = build_eval_env(config)
+        difficulty = 5
+        reset_options = dict(library[difficulty][episode_index % len(library[difficulty])])
+        try:
+            obs, _ = eval_env.reset(
+                seed=seed + 7000 + episode_index,
+                options={"curriculum_difficulty": difficulty, **reset_options},
+            )
+            done = False
+            total_reward = 0.0
+            trajectory: list[dict[str, Any]] = []
+            final_info: dict[str, Any] = {}
+            while not done:
+                raw_env = eval_env.unwrapped
+                mask = np.asarray(raw_env.action_masks(), dtype=np.int8)
+                action_int = _greedy_expert_flat_action(raw_env, mask)
+                pre_obs = np.asarray(obs, dtype=np.float32)
+                next_obs, reward, terminated, truncated, info = eval_env.step(int(action_int))
+                trajectory.append(
+                    {
+                        "obs": pre_obs,
+                        "action": int(action_int),
+                        "mask": np.asarray(mask, dtype=np.int8),
+                        "next_obs": np.asarray(next_obs, dtype=np.float32),
+                        "reward": float(reward),
+                        "info": dict(info),
+                    }
+                )
+                total_reward += float(reward)
+                final_info = dict(info)
+                obs = next_obs
+                done = bool(terminated or truncated)
+
+            delivery_score = float(DeliverySuccessGrader(trajectory).score())
+            all_scores.append(delivery_score)
+            if delivery_score >= float(min_delivery_score):
+                kept_results.append(
+                    {
+                        "delivery_score": delivery_score,
+                        "composite_score": float(CompositeGrader(trajectory).score()),
+                        "trajectory": trajectory,
+                        "delivery_success": bool(final_info.get("delivery_success", False)),
+                        "termination_reason": str(final_info.get("termination_reason", "unknown")),
+                        "final_info": final_info,
+                        "scenario_family": str(reset_options.get("scenario_family", "extreme_unknown")),
+                        "total_reward": float(total_reward),
+                    }
+                )
+        finally:
+            eval_env.close()
+
+    if all_scores:
+        print(
+            "[Phase4 Harvest] "
+            f"kept={len(kept_results)}/{len(all_scores)}, "
+            f"delivery_score(min/mean/max)=({min(all_scores):.3f}/{float(np.mean(all_scores)):.3f}/{max(all_scores):.3f})"
+        )
+    return {"results": kept_results, "scores": all_scores}
+
+
+def extract_critical_states(
+    harvest_results: list[dict[str, Any]],
+    *,
+    n_nodes: int,
+) -> dict[str, list[dict[str, Any]]]:
+    grouped: dict[str, list[dict[str, Any]]] = {"diversion": [], "triage": [], "abort": []}
+
+    for episode in harvest_results:
+        for step in episode.get("trajectory", []):
+            info = dict(step.get("info", {}))
+            action = int(step.get("action", 0))
+            action_type = _decode_action_type(action, n_nodes)
+            vehicle_index = int(action // (6 * n_nodes))
+
+            vehicle_status = _status_lookup(info.get("per_vehicle_status", {}), vehicle_index)
+            refrig_status = int(vehicle_status.get("refrig_status", 0))
+
+            shipment_status_map = info.get("per_shipment_status", {}) or {}
+            critical_undelivered = 0
+            for shipment in shipment_status_map.values():
+                if int(shipment.get("priority", 0)) == 2 and not bool(shipment.get("is_delivered", False)) and not bool(shipment.get("is_destroyed", False)):
+                    critical_undelivered += 1
+
+            row = {
+                "obs": np.asarray(step.get("obs"), dtype=np.float32),
+                "mask": np.asarray(step.get("mask"), dtype=np.float32),
+                "action": int(action),
+            }
+            if refrig_status in (1, 2) and action_type == 2:
+                grouped["diversion"].append(row)
+            if critical_undelivered >= 2 and action_type == 1:
+                grouped["triage"].append(row)
+            if action_type == 5:
+                grouped["abort"].append(row)
+
+    print(
+        "[Phase4 CriticalStates] "
+        f"diversion={len(grouped['diversion'])}, "
+        f"triage={len(grouped['triage'])}, abort={len(grouped['abort'])}"
+    )
+    return grouped
+
+
+def margin_loss(logits: torch.Tensor, target_action: torch.Tensor, action_mask: torch.Tensor, margin: float = 2.0) -> torch.Tensor:
+    masked_logits = logits.masked_fill(action_mask <= 0.0, -1e9)
+    target_logit = logits.gather(1, target_action.unsqueeze(1)).squeeze(1)
+    masked_logits_no_target = masked_logits.scatter(1, target_action.unsqueeze(1), -1e9)
+    best_other = masked_logits_no_target.max(dim=1).values
+    margin_violation = F.relu(best_other - target_logit + float(margin))
+    ce = F.cross_entropy(logits, target_action)
+    return ce + 0.5 * margin_violation.mean()
+
+
+def measure_logit_margin(model, states: list[dict[str, Any]], limit: int = 100) -> float:
+    if not states:
+        return 0.0
+    sample = states[: max(1, min(int(limit), len(states)))]
+    margins: list[float] = []
+    with torch.no_grad():
+        for row in sample:
+            obs_tensor, _ = model.policy.obs_to_tensor(np.asarray(row["obs"], dtype=np.float32))
+            mask_tensor = torch.as_tensor(np.asarray(row["mask"], dtype=np.float32), device=model.device).unsqueeze(0)
+            logits = model.policy.get_distribution(obs_tensor, action_masks=mask_tensor).distribution.logits
+            masked = logits.masked_fill(mask_tensor <= 0.0, -1e9)
+            top2 = torch.topk(masked, k=2, dim=1).values.squeeze(0)
+            margins.append(float((top2[0] - top2[1]).detach().cpu().item()))
+    return float(np.mean(margins)) if margins else 0.0
+
+
+def _hard_tier_score(model, *, seed: int, evaluation_training_step: int) -> float:
+    report = run_full_evaluation(
+        model,
+        seed=int(seed),
+        deterministic=True,
+        evaluation_training_step=int(evaluation_training_step),
+        trace_every=0,
+    )
+    return float(_row_by_tier(report.get("rows", []), "hard").get("score", 0.0))
+
+
+def _write_phase4_report(seed: int, payload: dict[str, Any]) -> str:
+    report_dir = os.path.join("artifacts", "phase4")
+    os.makedirs(report_dir, exist_ok=True)
+    report_path = os.path.join(report_dir, f"phase4_report_seed{int(seed)}.json")
+    with open(report_path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True)
+    print(f"[Phase4] Report saved: {report_path}")
+    return report_path
+
+
+def run_targeted_bc_alignment(
+    model,
+    critical_states: dict[str, list[dict[str, Any]]],
+    *,
+    seed: int,
+    evaluation_training_step: int,
+    hard_guard_threshold: float = 0.60,
+) -> dict[str, Any]:
+    summaries: dict[str, Any] = {}
+    for state_type in ("diversion", "triage", "abort"):
+        states = list(critical_states.get(state_type, []))
+        if len(states) < 20:
+            summaries[state_type] = {"skipped": True, "reason": f"insufficient samples ({len(states)})"}
+            print(f"[Phase4 BC] skip {state_type}: only {len(states)} states")
+            continue
+
+        pre_margin = measure_logit_margin(model, states)
+        obs_array = np.asarray([row["obs"] for row in states], dtype=np.float32)
+        action_array = np.asarray([int(row["action"]) for row in states], dtype=np.int64)
+        mask_array = np.asarray([row["mask"] for row in states], dtype=np.float32)
+
+        old_lrs = [float(group["lr"]) for group in model.policy.optimizer.param_groups]
+        for group in model.policy.optimizer.param_groups:
+            group["lr"] = 5e-5
+
+        model.policy.set_training_mode(True)
+        order = np.arange(action_array.shape[0])
+        latest_loss = 0.0
+        for _ in range(3):
+            np.random.shuffle(order)
+            for start in range(0, len(order), 64):
+                batch_idx = order[start : start + 64]
+                batch_obs, _ = model.policy.obs_to_tensor(obs_array[batch_idx])
+                batch_actions = torch.as_tensor(action_array[batch_idx], device=model.device, dtype=torch.long)
+                batch_masks = torch.as_tensor(mask_array[batch_idx], device=model.device, dtype=torch.float32)
+                dist = model.policy.get_distribution(batch_obs, action_masks=batch_masks)
+                logits = dist.distribution.logits
+                loss = margin_loss(logits, batch_actions, batch_masks, margin=2.0)
+                model.policy.optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.policy.parameters(), max_norm=0.3)
+                model.policy.optimizer.step()
+                latest_loss = float(loss.detach().cpu().item())
+        model.policy.set_training_mode(False)
+
+        for group, old_lr in zip(model.policy.optimizer.param_groups, old_lrs):
+            group["lr"] = old_lr
+
+        post_margin = measure_logit_margin(model, states)
+        hard_score = _hard_tier_score(model, seed=seed, evaluation_training_step=evaluation_training_step)
+        summaries[state_type] = {
+            "skipped": False,
+            "count": len(states),
+            "pre_margin": pre_margin,
+            "post_margin": post_margin,
+            "loss": latest_loss,
+            "hard_score": hard_score,
+        }
+        print(
+            f"[Phase4 BC] {state_type}: count={len(states)}, pre_margin={pre_margin:.3f}, "
+            f"post_margin={post_margin:.3f}, hard_score={hard_score:.4f}"
+        )
+        if hard_score < float(hard_guard_threshold):
+            summaries["hard_guard_failed"] = True
+            summaries["failed_at"] = state_type
+            return summaries
+    summaries["hard_guard_failed"] = False
+    return summaries
+
+
+def bc_completion_check(
+    model,
+    config: ColdChainConfig,
+    *,
+    seed: int,
+    evaluation_training_step: int,
+    hard_threshold: float = 0.65,
+) -> dict[str, Any]:
+    tier_report = run_tier_aligned_validation(
+        model,
+        config,
+        seed=seed,
+        evaluation_training_step=evaluation_training_step,
+        n_episodes=20,
+        include_official_grader=False,
+    )
+    det_extreme = float(tier_report.get("extreme", {}).get("deterministic_delivery_rate", 0.0))
+    sto_extreme = float(tier_report.get("extreme", {}).get("stochastic_delivery_rate", 0.0))
+    hard_score = _hard_tier_score(model, seed=seed, evaluation_training_step=evaluation_training_step)
+
+    checks = {
+        "det_extreme_gt_5pct": det_extreme > 0.05,
+        "hard_score_gate": hard_score >= float(hard_threshold),
+        "sto_extreme_ge_15pct": sto_extreme >= 0.15,
+    }
+    print(
+        "[Phase4 BC Gate] "
+        f"det_extreme={det_extreme:.2%}, hard={hard_score:.4f}, hard_threshold={float(hard_threshold):.4f}, "
+        f"sto_extreme={sto_extreme:.2%}, checks={checks}"
+    )
+    return {
+        "det_extreme": det_extreme,
+        "hard_score": hard_score,
+        "sto_extreme": sto_extreme,
+        "checks": checks,
+        "pass_all": bool(all(checks.values())),
     }
 
 
@@ -1373,10 +1752,12 @@ def run_training_phase(
     enable_refrigeration_reaction=False,
     enable_bc_warmstart=True,
     enable_tier_aligned_validation=True,
+    enable_phase4_alignment=False,
 ):
     print(f"\n--- [Phase {phase}] Training for {steps} steps ---")
 
     curriculum_difficulty = 1 if phase == 1 else (3 if phase == 2 else 5)
+    phase3_continuation = _is_phase3_continuation(phase, resume_path)
     ppo_hyperparams = _phase_ppo_hyperparams(phase)
     config = _base_training_space_config(phase)
     if phase == 3 and resume_path and os.path.exists(resume_path):
@@ -1395,6 +1776,8 @@ def run_training_phase(
             "[Phase 3] Difficulty-aware reward normalization ENABLED "
             f"(alpha={config.reward_norm_alpha}, warmup={config.reward_norm_warmup_steps}, clip={config.reward_norm_clip})."
         )
+    if phase3_continuation:
+        print("[Phase 3] Continuation mode: extreme-focused curriculum + stronger BC alignment.")
     
     # Run exploit-proof gate on stable base difficulty so it measures reward-path
     # exploitability rather than random destruction noise at hard difficulty.
@@ -1457,10 +1840,14 @@ def run_training_phase(
     if phase >= 2:
         callbacks.insert(3, ExploitDetectorCallback(check_every=2000, destroy_threshold=0.5))
     if phase == 3 and masking_clean:
-        # Replace abrupt hard/extreme jump with a progressive curriculum ramp.
-        curriculum_env.difficulty_weights = _phase3_ramped_weights(0.0)
-        callbacks.insert(2, CurriculumRampCallback(curriculum_env=curriculum_env, total_steps=steps))
-        print("[Phase 3] Curriculum ramp enabled.")
+        if phase3_continuation:
+            curriculum_env.difficulty_weights = _phase3_focus_extreme_weights()
+            print(f"[Phase 3] Extreme-focused curriculum enabled: {curriculum_env.difficulty_weights}")
+        else:
+            # Replace abrupt hard/extreme jump with a progressive curriculum ramp.
+            curriculum_env.difficulty_weights = _phase3_ramped_weights(0.0)
+            callbacks.insert(2, CurriculumRampCallback(curriculum_env=curriculum_env, total_steps=steps))
+            print("[Phase 3] Curriculum ramp enabled.")
     elif phase == 3:
         print("[Phase 3] Curriculum ramp skipped because is_active audit failed.")
     
@@ -1496,14 +1883,97 @@ def run_training_phase(
             seed=seed
         )
 
-    if phase == 3 and bool(enable_bc_warmstart):
+    if phase == 3 and bool(enable_phase4_alignment):
+        pre_bc_checkpoint = "models/ppo_phase3_pre_bc_backup.zip"
+        os.makedirs("models", exist_ok=True)
+        _ensure_gym_version_for_sb3()
+        model.save(pre_bc_checkpoint)
+        print(f"[Phase4] Saved pre-BC backup checkpoint: {pre_bc_checkpoint}")
+
+        eval_step = max(int(model.num_timesteps), int(config.penalty_anneal_steps))
+        baseline_hard = _hard_tier_score(model, seed=seed, evaluation_training_step=eval_step)
+        hard_guard_threshold = 0.60 if baseline_hard >= 0.60 else max(0.50, baseline_hard - 0.03)
+        hard_gate_threshold = 0.65 if baseline_hard >= 0.65 else max(0.50, baseline_hard - 0.02)
+        print(
+            "[Phase4] Hard baseline="
+            f"{baseline_hard:.4f}, guard_threshold={hard_guard_threshold:.4f}, gate_threshold={hard_gate_threshold:.4f}"
+        )
+
+        harvest_episodes = 500 if int(steps) >= 15000 else 120
+        print(f"[Phase4] Harvest episodes={harvest_episodes}")
+        harvest = harvest_expert_trajectories(config, seed=seed, n_episodes=harvest_episodes, min_delivery_score=0.40)
+        harvested_results = list(harvest.get("results", []))
+        critical_states = extract_critical_states(harvested_results, n_nodes=int(config.n_nodes))
+
+        phase4_payload: dict[str, Any] = {
+            "seed": int(seed),
+            "steps": int(steps),
+            "pre_bc_checkpoint": pre_bc_checkpoint,
+            "baseline": {
+                "hard": float(baseline_hard),
+                "guard_threshold": float(hard_guard_threshold),
+                "gate_threshold": float(hard_gate_threshold),
+            },
+            "harvest": {
+                "episodes": int(harvest_episodes),
+                "kept": int(len(harvested_results)),
+                "score_min": float(min(harvest.get("scores", [0.0])) if harvest.get("scores") else 0.0),
+                "score_mean": float(np.mean(harvest.get("scores", [0.0])) if harvest.get("scores") else 0.0),
+                "score_max": float(max(harvest.get("scores", [0.0])) if harvest.get("scores") else 0.0),
+            },
+            "critical_states": {
+                "diversion": int(len(critical_states.get("diversion", []))),
+                "triage": int(len(critical_states.get("triage", []))),
+                "abort": int(len(critical_states.get("abort", []))),
+            },
+        }
+
+        if len(critical_states.get("diversion", [])) < 30:
+            print("[Phase4] WARNING: diversion states < 30. Observation augmentation may be needed before strict BC alignment.")
+
+        bc_summary = run_targeted_bc_alignment(
+            model,
+            critical_states,
+            seed=seed,
+            evaluation_training_step=eval_step,
+            hard_guard_threshold=hard_guard_threshold,
+        )
+
+        if bool(bc_summary.get("hard_guard_failed", False)):
+            print("[Phase4] Hard-tier guard failed during BC. Restoring pre-BC checkpoint.")
+            model = MaskablePPO.load(pre_bc_checkpoint, env=env)
+            _apply_loaded_ppo_hyperparams(model, ppo_hyperparams)
+            phase4_payload["bc_summary"] = bc_summary
+            phase4_payload["bc_gate"] = {"pass_all": False, "reason": "hard_guard_failed"}
+            _write_phase4_report(seed, phase4_payload)
+        else:
+            gate = bc_completion_check(
+                model,
+                config,
+                seed=seed,
+                evaluation_training_step=eval_step,
+                hard_threshold=hard_gate_threshold,
+            )
+            phase4_payload["bc_summary"] = bc_summary
+            phase4_payload["bc_gate"] = gate
+            if not bool(gate.get("pass_all", False)):
+                print("[Phase4] BC completion gate FAILED. Restoring pre-BC checkpoint before RL continuation.")
+                model = MaskablePPO.load(pre_bc_checkpoint, env=env)
+                _apply_loaded_ppo_hyperparams(model, ppo_hyperparams)
+                _write_phase4_report(seed, phase4_payload)
+            else:
+                print("[Phase4] BC completion gate PASSED. Proceeding to RL continuation.")
+                _write_phase4_report(seed, phase4_payload)
+
+    if phase == 3 and bool(enable_bc_warmstart) and not bool(enable_phase4_alignment):
         artifact_path = os.path.join("models", f"phase3_harvest_seed{seed}.npz")
         dataset = harvest_imitation_dataset(
             model,
             config,
             seed=seed,
             episodes_per_scenario=4,
-            top_percentile=0.35,
+            top_percentile=0.50 if phase3_continuation else 0.35,
+            extreme_focus=bool(phase3_continuation),
             artifact_path=artifact_path,
         )
         rank_summary = _dataset_rank_summary(dataset)
@@ -1517,7 +1987,7 @@ def run_training_phase(
         bc_summary = run_behavior_cloning_warmstart(
             model,
             dataset,
-            epochs=3,
+            epochs=5 if phase3_continuation else 3,
             batch_size=min(128, int(ppo_hyperparams["batch_size"])),
         )
         print(
@@ -1695,6 +2165,7 @@ if __name__ == "__main__":
     parser.add_argument("--enable-refrigeration-reaction", action="store_true")
     parser.add_argument("--disable-bc-warmstart", action="store_true")
     parser.add_argument("--disable-tier-aligned-validation", action="store_true")
+    parser.add_argument("--enable-phase4-alignment", action="store_true")
     args = parser.parse_args()
     
     phases = {
@@ -1711,4 +2182,5 @@ if __name__ == "__main__":
         enable_refrigeration_reaction=bool(args.enable_refrigeration_reaction),
         enable_bc_warmstart=not bool(args.disable_bc_warmstart),
         enable_tier_aligned_validation=not bool(args.disable_tier_aligned_validation),
+        enable_phase4_alignment=bool(args.enable_phase4_alignment),
     )
