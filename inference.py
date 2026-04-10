@@ -33,6 +33,7 @@ LOCAL_IMAGE_NAME = os.getenv("LOCAL_IMAGE_NAME", "")
 DEFAULT_TASK_NAME = "coldchain-gym"
 DEFAULT_BENCHMARK_NAME = "coldchain-gym"
 DEFAULT_REQUEST_TIMEOUT = float(os.getenv("LLM_REQUEST_TIMEOUT", "20"))
+DEFAULT_TASK_SEQUENCE = ["easy", "moderate", "hard", "extreme"]
 
 ACTION_NAMES = {
     0: "WAIT",
@@ -318,6 +319,19 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _resolve_task_sequence(task_name: str) -> list[str]:
+    raw = str(task_name).strip()
+    if not raw:
+        return ["hard"]
+    lowered = raw.lower()
+    if lowered in {"all", "*"}:
+        return list(DEFAULT_TASK_SEQUENCE)
+    if "," in raw:
+        items = [item.strip().lower() for item in raw.split(",") if item.strip()]
+        return items or ["hard"]
+    return [lowered]
+
+
 def main() -> None:
     args = _parse_args()
     config = ColdChainConfig(max_steps=int(args.max_steps))
@@ -330,8 +344,11 @@ def main() -> None:
     info: dict[str, Any] = {}
     grader_scores: dict[str, Any] = {}
     termination_reason = "unknown"
+    task_outcomes: list[dict[str, Any]] = []
     client: OpenAI | None = None
     client_error: str | None = None
+    task_sequence = _resolve_task_sequence(args.task_name)
+    total_step_budget = int(args.max_steps) * max(1, len(task_sequence))
 
     try:
         try:
@@ -342,64 +359,86 @@ def main() -> None:
         print(f"[START] task={args.task_name} env={args.benchmark} model={MODEL_NAME}", flush=True)
         start_emitted = True
 
-        obs, info = env.reset(seed=int(args.seed))
-        done = False
+        for task_index, task_id in enumerate(task_sequence):
+            if steps >= total_step_budget:
+                termination_reason = "task_budget_exhausted"
+                break
 
-        while not done:
-            observation = env._core._get_obs(reward=0.0, done=False, message="llm planning", info=info).model_dump()
-            legal_actions = _legal_actions(observation.get("action_mask", []), config)
-            if not legal_actions:
-                raise RuntimeError("No legal actions available")
-            candidate_actions = _ranked_actions(legal_actions, observation, config)
+            obs, info = env.reset(seed=int(args.seed) + task_index, options={"task": task_id})
+            done = False
+            task_steps = 0
 
-            action_error: str | None = None
-            if client is not None:
-                try:
-                    action = _request_action(
-                        client=client,
-                        model_name=MODEL_NAME,
-                        observation=observation,
-                        candidate_actions=candidate_actions,
-                        task_name=args.task_name,
-                        benchmark_name=args.benchmark,
-                        request_timeout=float(args.request_timeout),
-                    )
-                except Exception as exc:
-                    action_error = str(exc)
+            while not done and task_steps < int(args.max_steps) and steps < total_step_budget:
+                observation = env._core._get_obs(reward=0.0, done=False, message="llm planning", info=info).model_dump()
+                legal_actions = _legal_actions(observation.get("action_mask", []), config)
+                if not legal_actions:
+                    raise RuntimeError("No legal actions available")
+                candidate_actions = _ranked_actions(legal_actions, observation, config)
+
+                action_error: str | None = None
+                if client is not None:
+                    try:
+                        action = _request_action(
+                            client=client,
+                            model_name=MODEL_NAME,
+                            observation=observation,
+                            candidate_actions=candidate_actions,
+                            task_name=task_id,
+                            benchmark_name=args.benchmark,
+                            request_timeout=float(args.request_timeout),
+                        )
+                    except Exception as exc:
+                        action_error = str(exc)
+                        action = _choose_fallback_action(candidate_actions, observation, config)
+                else:
                     action = _choose_fallback_action(candidate_actions, observation, config)
-            else:
-                action = _choose_fallback_action(candidate_actions, observation, config)
 
-            if not _validate_action(action, candidate_actions):
-                if action_error is None:
-                    action_error = "Model produced an illegal action; replaced with fallback"
-                action = _choose_fallback_action(candidate_actions, observation, config)
+                if not _validate_action(action, candidate_actions):
+                    if action_error is None:
+                        action_error = "Model produced an illegal action; replaced with fallback"
+                    action = _choose_fallback_action(candidate_actions, observation, config)
 
-            obs, reward, terminated, truncated, info = env.step(
-                [action["vehicle_index"], action["action_type"], action["target_index"]]
+                obs, reward, terminated, truncated, info = env.step(
+                    [action["vehicle_index"], action["action_type"], action["target_index"]]
+                )
+                done = bool(terminated or truncated)
+                steps += 1
+                task_steps += 1
+                rewards.append(float(reward))
+
+                env_error = info.get("last_action_error")
+                print(
+                    "[STEP] "
+                    f"task={task_id} "
+                    f"step={steps} "
+                    f"action={_action_to_str(action)} "
+                    f"reward={_fmt_float(reward)} "
+                    f"done={_bool_text(done)} "
+                    f"error={_format_error(env_error)}",
+                    flush=True,
+                )
+
+            grader_scores = dict(info.get("grader_scores", {}))
+            task_score = float(info.get("task_reward", grader_scores.get(task_id, grader_scores.get("composite", 0.0))))
+            task_success = bool(info.get("delivery_success", False))
+            task_reason = str(info.get("termination_reason", "max_steps" if task_steps >= int(args.max_steps) else "unknown"))
+            task_outcomes.append(
+                {
+                    "task": task_id,
+                    "score": max(0.0, min(1.0, task_score)),
+                    "success": task_success,
+                    "termination_reason": task_reason,
+                    "steps": task_steps,
+                }
             )
-            done = bool(terminated or truncated)
-            steps += 1
-            rewards.append(float(reward))
 
-            env_error = info.get("last_action_error")
-
-            print(
-                "[STEP] "
-                f"step={steps} "
-                f"action={_action_to_str(action)} "
-                f"reward={_fmt_float(reward)} "
-                f"done={_bool_text(done)} "
-                f"error={_format_error(env_error)}"
-                ,
-                flush=True,
-            )
-
-        grader_scores = info.get("grader_scores", {})
-        raw_score = grader_scores.get("composite", 1.0 if info.get("delivery_success") else 0.0)
-        end_score = max(0.0, min(1.0, float(raw_score)))
-        success = bool(info.get("delivery_success", False))
-        termination_reason = str(info.get("termination_reason", "unknown"))
+        if task_outcomes:
+            end_score = float(sum(item["score"] for item in task_outcomes) / len(task_outcomes))
+            success = bool(all(bool(item["success"]) for item in task_outcomes))
+            termination_reason = "all_tasks_completed"
+        else:
+            success = False
+            termination_reason = "no_task_completed"
     except Exception:
         success = False
     finally:
@@ -411,6 +450,7 @@ def main() -> None:
             "[END] "
             f"success={_bool_text(success)} "
             f"steps={steps} "
+            f"tasks={len(task_sequence)} "
             f"termination_reason={termination_reason} "
             f"score={_fmt_float(end_score)} "
             f"delivery_score={_fmt_float(float(grader_scores.get('delivery', 0.0)))} "
