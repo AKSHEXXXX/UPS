@@ -22,8 +22,15 @@ class HardEmergencyCaseGrader(BaseGrader):
         for transition in self.trajectory:
             action = transition[1] if len(transition) > 1 else None
             info = transition[3] if len(transition) > 3 else {}
-            if action is not None and len(action) > 1 and int(action[1]) in {2, 5}:
-                emergency_action_seen = True
+            if action is not None:
+                action_type = None
+                if isinstance(action, dict):
+                    action_type = action.get("action_type")
+                elif isinstance(action, (tuple, list)) and len(action) > 1:
+                    action_type = action[1]
+
+                if action_type is not None and int(action_type) in {2, 5}:
+                    emergency_action_seen = True
 
             per_shipment = info.get("per_shipment_status", {})
             for shipment in per_shipment.values():

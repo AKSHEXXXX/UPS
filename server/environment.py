@@ -15,7 +15,16 @@ from openenv.core.env_server.types import State
 from core.action_mask import compute_action_mask, flatten_action
 from core.city_graph import build_city_graph, detour_cost, nearest_cold_depot, refresh_edge_weights
 from core.config import ColdChainConfig
-from core.graders import CompositeGrader, DeliverySuccessGrader, EfficiencyGrader, ThermalIntegrityGrader
+from core.graders import (
+    BasicGrader,
+    CompositeGrader,
+    DeliverySuccessGrader,
+    EfficiencyGrader,
+    HardEmergencyCaseGrader,
+    HardGrader,
+    ModerateGrader,
+    ThermalIntegrityGrader,
+)
 from core.models import ColdChainAction, ColdChainObservation, ColdChainState, GlobalTelemetry, ShipmentTelemetry, VehicleTelemetry
 from core.reward import compute_step_reward, partial_delivery_terminal_reward
 from core.shipment import CARGO_SPECS, Shipment, update_temperature
@@ -25,6 +34,12 @@ from core.weather import WeatherEvent, WeatherSystem
 
 class ColdChainEnvironment(Environment):
     SUPPORTS_CONCURRENT_SESSIONS: bool = True
+    TASK_REWARD_CONFIG: Dict[str, Dict[str, Any]] = {
+        "easy": {"difficulty": 1, "reward_key": "easy"},
+        "moderate": {"difficulty": 2, "reward_key": "moderate"},
+        "hard": {"difficulty": 3, "reward_key": "hard"},
+        "extreme": {"difficulty": 4, "reward_key": "extreme"},
+    }
 
     def __init__(self, config: Optional[ColdChainConfig] = None):
         self.config = config or ColdChainConfig()
@@ -54,8 +69,24 @@ class ColdChainEnvironment(Environment):
         self._forced_weather_schedule: Dict[int, tuple[WeatherEvent, int]] = {}
         self._forced_weather_only: bool = False
         self._forced_breakdown_schedule: Dict[int, List[int]] = {}
+        self._active_task_id: str = "hard"
+        self._task_reward_key: str = "hard"
+
+    def _resolve_task_id(self, raw_task_id: Any) -> str:
+        if raw_task_id is None:
+            return "hard"
+        normalized = str(raw_task_id).strip().lower()
+        if normalized in self.TASK_REWARD_CONFIG:
+            return normalized
+        return "hard"
 
     def reset(self, seed: Optional[int] = None, episode_id=None, **kwargs) -> ColdChainObservation:
+        selected_task = self._resolve_task_id(kwargs.get("task_id", kwargs.get("task", kwargs.get("benchmark"))))
+        self._active_task_id = selected_task
+        self._task_reward_key = str(self.TASK_REWARD_CONFIG[selected_task]["reward_key"])
+        if "curriculum_difficulty" not in kwargs:
+            kwargs["curriculum_difficulty"] = int(self.TASK_REWARD_CONFIG[selected_task]["difficulty"])
+
         self._rng = np.random.default_rng(seed if seed is not None else self.config.graph_seed)
         self.graph = build_city_graph(self.config, self._rng)
         self.weather = WeatherSystem()
@@ -366,6 +397,9 @@ class ColdChainEnvironment(Environment):
         self._update_visible_temperature_cache()
         curr_locations = tuple(vehicle.location for vehicle in self.vehicles)
         info.update(self._get_info())
+        if self._episode_done and "task_reward" in info:
+            reward = float(info["task_reward"])
+            info["reward_overridden_with_task_score"] = True
         observation = self._get_obs(reward=reward, done=self._episode_done, message="step complete", info=info)
         if self.config.debug_step_trace:
             print(
@@ -691,6 +725,11 @@ class ColdChainEnvironment(Environment):
         return ColdChainObservation(
             done=done,
             reward=reward,
+            metadata={
+                "task_id": self._active_task_id,
+                "reward_function": self._task_reward_key,
+                "task_reward": float((info or {}).get("task_reward", 0.0)) if done else None,
+            },
             global_state=global_obs,
             vehicles=vehicle_rows,
             shipments=shipment_rows,
@@ -727,6 +766,8 @@ class ColdChainEnvironment(Environment):
             "action_was_masked": self._last_action_was_masked,
             "illegal_action_count": self._illegal_action_count,
             "last_action_error": self._last_action_error,
+            "task_id": self._active_task_id,
+            "reward_function": self._task_reward_key,
             "last_action_type": self._last_action_type,
             "same_action_streak": self._same_action_streak,
             "transit_no_progress_streak": dict(self._transit_no_progress_streak),
@@ -739,19 +780,43 @@ class ColdChainEnvironment(Environment):
             "per_vehicle_status": {vehicle.id: dataclasses.asdict(vehicle) for vehicle in self.vehicles},
         }
         if self._episode_done:
-            info["grader_scores"] = self._compute_grader_scores()
+            grader_scores = self._compute_grader_scores()
+            info["grader_scores"] = grader_scores
+            info["task_reward"] = float(grader_scores.get(self._task_reward_key, grader_scores.get("composite", 0.0)))
             info["episode_summary"] = self._build_episode_summary()
         return info
 
     def _compute_grader_scores(self) -> Dict[str, float]:
         trajectory = self._trajectory
         if not trajectory:
-            return {"delivery": 0.0, "thermal": 0.0, "efficiency": 0.0, "composite": 0.0}
+            return {
+                "delivery": 0.0,
+                "thermal": 0.0,
+                "efficiency": 0.0,
+                "composite": 0.0,
+                "easy": 0.0,
+                "moderate": 0.0,
+                "hard": 0.0,
+                "extreme": 0.0,
+            }
         delivery = DeliverySuccessGrader(trajectory).score()
         thermal = ThermalIntegrityGrader(trajectory).score()
         efficiency = EfficiencyGrader(trajectory).score()
         composite = CompositeGrader(trajectory).score()
-        return {"delivery": delivery, "thermal": thermal, "efficiency": efficiency, "composite": composite}
+        easy = BasicGrader(trajectory).score()
+        moderate = ModerateGrader(trajectory).score()
+        hard = HardGrader(trajectory).score()
+        extreme = HardEmergencyCaseGrader(trajectory).score()
+        return {
+            "delivery": delivery,
+            "thermal": thermal,
+            "efficiency": efficiency,
+            "composite": composite,
+            "easy": easy,
+            "moderate": moderate,
+            "hard": hard,
+            "extreme": extreme,
+        }
 
     def _all_shipments_complete(self) -> bool:
         return all(shipment.is_delivered or shipment.is_destroyed for shipment in self._active_shipments())

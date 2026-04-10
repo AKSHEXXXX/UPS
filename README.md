@@ -9,7 +9,7 @@ pinned: false
 tasks:
   - id: easy
     name: Easy Tier
-    grader: EasyGrader
+    grader: BasicGrader
   - id: moderate
     name: Moderate Tier
     grader: ModerateGrader
