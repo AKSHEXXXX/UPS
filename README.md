@@ -10,15 +10,23 @@ tasks:
   - id: easy
     name: Easy Tier
     grader: BasicGrader
+    graders:
+      - BasicGrader
   - id: moderate
     name: Moderate Tier
     grader: ModerateGrader
+    graders:
+      - ModerateGrader
   - id: hard
     name: Hard Tier
     grader: HardGrader
+    graders:
+      - HardGrader
   - id: extreme
     name: Extreme Tier
     grader: HardEmergencyCaseGrader
+    graders:
+      - HardEmergencyCaseGrader
 ---
 
 <div align="center">
