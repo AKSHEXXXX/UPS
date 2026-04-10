@@ -341,8 +341,6 @@ def main() -> None:
             client_error = str(exc)
         print(f"[START] task={args.task_name} env={args.benchmark} model={MODEL_NAME}", flush=True)
         start_emitted = True
-        if client is None:
-            print(f"[INFO] LLM client unavailable, using heuristic fallback policy ({_single_line(client_error or 'unknown error')})", flush=True)
 
         obs, info = env.reset(seed=int(args.seed))
         done = False

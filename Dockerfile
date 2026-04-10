@@ -68,11 +68,19 @@ COPY --from=builder /app/env/.venv /app/.venv
 # This avoids re-copying builder's .venv a second time.
 COPY . /app/env
 
+# Compliance check: inference entrypoint must exist at project root.
+RUN test -f /app/env/inference.py
+
 # Set PATH to use the virtual environment
 ENV PATH="/app/.venv/bin:$PATH"
 
 # Set PYTHONPATH so imports from reorganized folders are always resolvable.
 ENV PYTHONPATH="/app/env:/app/env/algorithms:/app/env/evaluation:/app/env/graders:$PYTHONPATH"
+
+# Required LLM inference configuration defaults (override via environment/secrets).
+ENV API_BASE_URL="https://api.openai.com/v1"
+ENV MODEL_NAME="gpt-4.1-mini"
+ENV HF_TOKEN=""
 
 # Health check using Python stdlib to avoid runtime curl dependency.
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \

@@ -138,3 +138,37 @@ Run targeted regression after this reorganization:
 - Interpretation:
   - pipeline is functioning end-to-end
   - deterministic extreme performance remains the primary bottleneck
+
+## Latest Update II (10 Apr 2026)
+
+1. Strict phase-4 alignment path implemented and exercised
+- Added guarded phase-4 path in training behind `enable_phase4_alignment`.
+- Added pre-BC rollback checkpoint safety before targeted alignment.
+- Added phase-4 artifact writer at `artifacts/phase4/phase4_report_seed42.json`.
+- Added typed critical-state alignment flow (diversion/triage/abort buckets) with completion gates.
+
+2. Latest phase-4 continuation evidence (20k)
+- Run used:
+  - phase 3 continuation from `models/ppo_phase3.zip`
+  - refrigeration reaction enabled
+  - BC warm-start disabled (phase-4 path active)
+  - tier-aligned validation enabled
+  - phase-4 alignment enabled
+- Observed from phase-4 logs/report:
+  - pre-BC backup checkpoint saved successfully
+  - harvest and critical-state extraction completed
+  - targeted BC passes executed
+  - BC completion gate failed and model restored from pre-BC backup
+- Validation summary remained:
+  - hard deterministic delivery around `20%`
+  - extreme deterministic delivery `0%`
+  - robustness gate not yet met
+
+3. Inference and credential handling update completed
+- `inference.py` now auto-loads local `.env` when available.
+- API key resolution now accepts `HF_TOKEN`, `OPENAI_API_KEY`, or `OPENAI_TOKEN`.
+- Existing fallback behavior remains: if LLM client setup fails, heuristic policy is used.
+
+4. Repository hygiene/security verification
+- Confirmed `.env` stays ignored by git and was not pushed.
+- Cross-branch and full-history secret scans were run; no leaked keys or committed `.env` files were detected.
