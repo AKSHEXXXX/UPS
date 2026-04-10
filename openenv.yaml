@@ -4,4 +4,29 @@ type: space
 runtime: fastapi
 app: server.app:app
 port: 8000
+tasks:
+  - id: easy
+    name: Easy Tier
+    difficulty: easy
+    grader:
+      name: EasyGrader
+      entrypoint: core.graders.new_levels:EasyGrader
+  - id: moderate
+    name: Moderate Tier
+    difficulty: moderate
+    grader:
+      name: ModerateGrader
+      entrypoint: core.graders.moderate_grader:ModerateGrader
+  - id: hard
+    name: Hard Tier
+    difficulty: hard
+    grader:
+      name: HardGrader
+      entrypoint: core.graders.hard_grader:HardGrader
+  - id: extreme
+    name: Extreme Tier
+    difficulty: extreme
+    grader:
+      name: HardEmergencyCaseGrader
+      entrypoint: core.graders.hard_emergency:HardEmergencyCaseGrader
 

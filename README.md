@@ -6,6 +6,19 @@ colorTo: green
 sdk: docker
 app_port: 8000
 pinned: false
+tasks:
+  - id: easy
+    name: Easy Tier
+    grader: EasyGrader
+  - id: moderate
+    name: Moderate Tier
+    grader: ModerateGrader
+  - id: hard
+    name: Hard Tier
+    grader: HardGrader
+  - id: extreme
+    name: Extreme Tier
+    grader: HardEmergencyCaseGrader
 ---
 
 <div align="center">
