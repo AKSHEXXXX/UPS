@@ -36,7 +36,8 @@ class ColdChainEnvironment(Environment):
     SUPPORTS_CONCURRENT_SESSIONS: bool = True
     TASK_REWARD_CONFIG: Dict[str, Dict[str, Any]] = {
         "easy": {"difficulty": 1, "reward_key": "easy"},
-        "moderate": {"difficulty": 2, "reward_key": "moderate"},
+        "medium": {"difficulty": 2, "reward_key": "medium"},
+        "moderate": {"difficulty": 2, "reward_key": "medium"},
         "hard": {"difficulty": 3, "reward_key": "hard"},
         "extreme": {"difficulty": 4, "reward_key": "extreme"},
     }
@@ -76,6 +77,8 @@ class ColdChainEnvironment(Environment):
         if raw_task_id is None:
             return "hard"
         normalized = str(raw_task_id).strip().lower()
+        if normalized == "moderate":
+            return "medium"
         if normalized in self.TASK_REWARD_CONFIG:
             return normalized
         return "hard"
@@ -795,6 +798,7 @@ class ColdChainEnvironment(Environment):
                 "efficiency": 0.0,
                 "composite": 0.0,
                 "easy": 0.0,
+                "medium": 0.0,
                 "moderate": 0.0,
                 "hard": 0.0,
                 "extreme": 0.0,
@@ -813,6 +817,7 @@ class ColdChainEnvironment(Environment):
             "efficiency": efficiency,
             "composite": composite,
             "easy": easy,
+            "medium": moderate,
             "moderate": moderate,
             "hard": hard,
             "extreme": extreme,

@@ -68,8 +68,13 @@ COPY --from=builder /app/env/.venv /app/.venv
 # This avoids re-copying builder's .venv a second time.
 COPY . /app/env
 
-# Compliance check: inference entrypoint must exist at project root.
-RUN test -f /app/env/inference.py
+# Compliance checks: ensure required runtime and metadata files are present.
+RUN test -f /app/env/inference.py && \
+    test -f /app/env/openenv.yaml && \
+    test -f /app/env/README.md
+
+# Create optional outputs directory used by validators and local tooling.
+RUN mkdir -p /app/env/outputs
 
 # Set PATH to use the virtual environment
 ENV PATH="/app/.venv/bin:$PATH"

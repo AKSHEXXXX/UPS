@@ -12,8 +12,8 @@ tasks:
     grader: BasicGrader
     graders:
       - BasicGrader
-  - id: moderate
-    name: Moderate Tier
+  - id: medium
+    name: Medium Tier
     grader: ModerateGrader
     graders:
       - ModerateGrader

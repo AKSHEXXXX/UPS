@@ -33,7 +33,7 @@ LOCAL_IMAGE_NAME = os.getenv("LOCAL_IMAGE_NAME", "")
 DEFAULT_TASK_NAME = "coldchain-gym"
 DEFAULT_BENCHMARK_NAME = "coldchain-gym"
 DEFAULT_REQUEST_TIMEOUT = float(os.getenv("LLM_REQUEST_TIMEOUT", "20"))
-DEFAULT_TASK_SEQUENCE = ["easy", "moderate", "hard", "extreme"]
+DEFAULT_TASK_SEQUENCE = ["easy", "medium", "hard", "extreme"]
 LOOP_REPEAT_THRESHOLD = 12
 
 ACTION_NAMES = {
@@ -329,7 +329,10 @@ def _resolve_task_sequence(task_name: str) -> list[str]:
         return list(DEFAULT_TASK_SEQUENCE)
     if "," in raw:
         items = [item.strip().lower() for item in raw.split(",") if item.strip()]
+        items = ["medium" if item == "moderate" else item for item in items]
         return items or ["hard"]
+    if lowered == "moderate":
+        lowered = "medium"
     return [lowered]
 
 
