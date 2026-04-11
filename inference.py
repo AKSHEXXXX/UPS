@@ -64,6 +64,10 @@ def _fmt_float(value: float) -> str:
     return f"{float(value):.2f}"
 
 
+def _clamp_submission_score(value: float) -> float:
+    return max(0.01, min(0.99, float(value)))
+
+
 def _single_line(value: str) -> str:
     return re.sub(r"\s+", " ", value).strip()
 
@@ -465,7 +469,7 @@ def main() -> None:
             task_outcomes.append(
                 {
                     "task": task_id,
-                    "score": max(0.0, min(1.0, task_score)),
+                    "score": _clamp_submission_score(task_score),
                     "success": task_success,
                     "termination_reason": task_reason,
                     "steps": task_steps,
@@ -473,7 +477,7 @@ def main() -> None:
             )
 
         if task_outcomes:
-            end_score = float(sum(item["score"] for item in task_outcomes) / len(task_outcomes))
+            end_score = _clamp_submission_score(float(sum(item["score"] for item in task_outcomes) / len(task_outcomes)))
             success = bool(all(bool(item["success"]) for item in task_outcomes))
             termination_reason = "all_tasks_completed"
         else:
@@ -485,7 +489,11 @@ def main() -> None:
         env.close()
         if not start_emitted:
             print(f"[START] task={args.task_name} env={args.benchmark} model={MODEL_NAME}", flush=True)
+        end_score = _clamp_submission_score(end_score)
         reward_text = ",".join(_fmt_float(reward) for reward in rewards)
+        end_delivery = _clamp_submission_score(float(grader_scores.get('delivery', 0.0)))
+        end_thermal = _clamp_submission_score(float(grader_scores.get('thermal', 0.0)))
+        end_efficiency = _clamp_submission_score(float(grader_scores.get('efficiency', 0.0)))
         print(
             "[END] "
             f"success={_bool_text(success)} "
@@ -493,9 +501,9 @@ def main() -> None:
             f"tasks={len(task_sequence)} "
             f"termination_reason={termination_reason} "
             f"score={_fmt_float(end_score)} "
-            f"delivery_score={_fmt_float(float(grader_scores.get('delivery', 0.0)))} "
-            f"thermal_score={_fmt_float(float(grader_scores.get('thermal', 0.0)))} "
-            f"efficiency_score={_fmt_float(float(grader_scores.get('efficiency', 0.0)))} "
+            f"delivery_score={_fmt_float(end_delivery)} "
+            f"thermal_score={_fmt_float(end_thermal)} "
+            f"efficiency_score={_fmt_float(end_efficiency)} "
             f"rewards={reward_text}",
             flush=True,
         )
