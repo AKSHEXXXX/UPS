@@ -3,7 +3,7 @@ from __future__ import annotations
 from .base import BaseGrader
 
 
-class HardEmergencyCaseGrader(BaseGrader):
+class ExtremeGrader(BaseGrader):
     """
     Lightweight emergency-case evaluator for hard runs.
 

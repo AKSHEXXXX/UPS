@@ -468,7 +468,7 @@ def main() -> None:
             task_outcomes.append(
                 {
                     "task": task_id,
-                    "score": max(1e-6, min(1 - 1e-6, task_score)),
+                    "score": max(0.01, min(0.99, task_score)),
                     "success": task_success,
                     "termination_reason": task_reason,
                     "steps": task_steps,
@@ -477,7 +477,7 @@ def main() -> None:
 
         if task_outcomes:
             end_score = float(sum(item["score"] for item in task_outcomes) / len(task_outcomes))
-            end_score = max(1e-6, min(end_score, 1 - 1e-6))  # clamp before print
+            end_score = max(0.01, min(end_score, 0.99))  # clamp before print
             success = bool(all(bool(item["success"]) for item in task_outcomes))
             termination_reason = "all_tasks_completed"
         else:
@@ -490,14 +490,8 @@ def main() -> None:
         if not start_emitted:
             print(f"[START] task={args.task_name} env={args.benchmark} model={MODEL_NAME}", flush=True)
         reward_text = ",".join(_fmt_float(reward) for reward in rewards)
-        score_clamped = max(1e-6, min(end_score, 1 - 1e-6))
-        print(
-            f"[END] success={_bool_text(success)} "
-            f"steps={steps} "
-            f"score={score_clamped:.3f} "
-            f"rewards={reward_text}",
-            flush=True,
-        )
+        final_score = max(0.01, min(0.99, float(end_score)))
+        print(f"[END] task={args.task_name} score={final_score:.2f} steps={steps}", flush=True)
 
 
 if __name__ == "__main__":

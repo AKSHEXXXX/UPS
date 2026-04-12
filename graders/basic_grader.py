@@ -5,7 +5,7 @@ from .delivery_success import DeliverySuccessGrader
 from .thermal_integrity import ThermalIntegrityGrader
 
 
-class BasicGrader(BaseGrader):
+class EasyGrader(BaseGrader):
     """
     Intro-level score focused on mission success + temperature safety.
 

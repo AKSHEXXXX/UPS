@@ -10,33 +10,25 @@ tasks:
     description: Easy cold-chain delivery objective with basic constraints.
     difficulty: easy
     reward_function: easy
-    graders:
-      - name: BasicGrader
-        entrypoint: graders.basic_grader:BasicGrader
+    grader: graders.basic_grader:EasyGrader
 
   - id: moderate
     name: Moderate Tier
     description: Medium objective with higher traffic and thermal risk.
     difficulty: moderate
     reward_function: moderate
-    graders:
-      - name: ModerateGrader
-        entrypoint: graders.moderate_grader:ModerateGrader
+    grader: graders.moderate_grader:ModerateGrader
 
   - id: hard
     name: Hard Tier
     description: Hard objective with multi-shipment conflicts and tight deadlines.
     difficulty: hard
     reward_function: hard
-    graders:
-      - name: HardGrader
-        entrypoint: graders.hard_grader:HardGrader
+    grader: graders.hard_grader:HardGrader
 
   - id: extreme
     name: Extreme Tier
     description: Extreme objective with emergency cases and severe constraints.
     difficulty: extreme
     reward_function: extreme
-    graders:
-      - name: HardEmergencyCaseGrader
-        entrypoint: graders.hard_emergency:HardEmergencyCaseGrader
+    grader: graders.hard_emergency:ExtremeGrader
