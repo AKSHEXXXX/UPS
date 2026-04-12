@@ -12,8 +12,8 @@ class BaseGrader(ABC):
     def score(self) -> float:
         if self._score is None:
             self._score = float(self._compute())
-            self._score = max(0.0, min(1.0, self._score))
-            assert 0.0 <= self._score <= 1.0, f"{self.__class__.__name__} returned {self._score}, must be in [0,1]"
+            self._score = max(1e-6, min(1 - 1e-6, self._score))    # ← strict open interval
+            assert 1e-6 <= self._score <= 1 - 1e-6, f"{self.__class__.__name__} returned {self._score}, must be in (0,1)"
         return self._score
 
     @abstractmethod

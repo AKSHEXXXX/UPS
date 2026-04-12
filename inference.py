@@ -444,8 +444,7 @@ def main() -> None:
 
                 env_error = info.get("last_action_error")
                 print(
-                    "[STEP] "
-                    f"task={task_id} "
+                    f"[STEP] "
                     f"step={steps} "
                     f"action={_action_to_str(action)} "
                     f"reward={_fmt_float(reward)} "
@@ -469,7 +468,7 @@ def main() -> None:
             task_outcomes.append(
                 {
                     "task": task_id,
-                    "score": _clamp_submission_score(task_score),
+                    "score": max(1e-6, min(1 - 1e-6, task_score)),
                     "success": task_success,
                     "termination_reason": task_reason,
                     "steps": task_steps,
@@ -477,7 +476,8 @@ def main() -> None:
             )
 
         if task_outcomes:
-            end_score = _clamp_submission_score(float(sum(item["score"] for item in task_outcomes) / len(task_outcomes)))
+            end_score = float(sum(item["score"] for item in task_outcomes) / len(task_outcomes))
+            end_score = max(1e-6, min(end_score, 1 - 1e-6))  # clamp before print
             success = bool(all(bool(item["success"]) for item in task_outcomes))
             termination_reason = "all_tasks_completed"
         else:
@@ -489,21 +489,12 @@ def main() -> None:
         env.close()
         if not start_emitted:
             print(f"[START] task={args.task_name} env={args.benchmark} model={MODEL_NAME}", flush=True)
-        end_score = _clamp_submission_score(end_score)
         reward_text = ",".join(_fmt_float(reward) for reward in rewards)
-        end_delivery = _clamp_submission_score(float(grader_scores.get('delivery', 0.0)))
-        end_thermal = _clamp_submission_score(float(grader_scores.get('thermal', 0.0)))
-        end_efficiency = _clamp_submission_score(float(grader_scores.get('efficiency', 0.0)))
+        score_clamped = max(1e-6, min(end_score, 1 - 1e-6))
         print(
-            "[END] "
-            f"success={_bool_text(success)} "
+            f"[END] success={_bool_text(success)} "
             f"steps={steps} "
-            f"tasks={len(task_sequence)} "
-            f"termination_reason={termination_reason} "
-            f"score={_fmt_float(end_score)} "
-            f"delivery_score={_fmt_float(end_delivery)} "
-            f"thermal_score={_fmt_float(end_thermal)} "
-            f"efficiency_score={_fmt_float(end_efficiency)} "
+            f"score={score_clamped:.3f} "
             f"rewards={reward_text}",
             flush=True,
         )
