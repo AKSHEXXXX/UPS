@@ -16,11 +16,11 @@ from core.action_mask import compute_action_mask, flatten_action
 from core.city_graph import build_city_graph, detour_cost, nearest_cold_depot, refresh_edge_weights
 from core.config import ColdChainConfig
 from graders import (
-    BasicGrader,
+    EasyGrader,
     CompositeGrader,
     DeliverySuccessGrader,
     EfficiencyGrader,
-    HardEmergencyCaseGrader,
+    ExtremeGrader,
     HardGrader,
     ModerateGrader,
     ThermalIntegrityGrader,
@@ -807,10 +807,10 @@ class ColdChainEnvironment(Environment):
         thermal = ThermalIntegrityGrader(trajectory).score()
         efficiency = EfficiencyGrader(trajectory).score()
         composite = CompositeGrader(trajectory).score()
-        easy = BasicGrader(trajectory).score()
+        easy = EasyGrader(trajectory).score()
         moderate = ModerateGrader(trajectory).score()
         hard = HardGrader(trajectory).score()
-        extreme = HardEmergencyCaseGrader(trajectory).score()
+        extreme = ExtremeGrader(trajectory).score()
         return {
             "delivery": delivery,
             "thermal": thermal,

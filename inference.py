@@ -474,6 +474,8 @@ def main() -> None:
                     "steps": task_steps,
                 }
             )
+            # Report individual task outcome for validator discovery
+            print(f"[END] task={task_id} score={max(0.01, min(0.99, task_score)):.2f} steps={task_steps}", flush=True)
 
         if task_outcomes:
             end_score = float(sum(item["score"] for item in task_outcomes) / len(task_outcomes))
@@ -490,8 +492,8 @@ def main() -> None:
         if not start_emitted:
             print(f"[START] task={args.task_name} env={args.benchmark} model={MODEL_NAME}", flush=True)
         reward_text = ",".join(_fmt_float(reward) for reward in rewards)
-        final_score = max(0.01, min(0.99, float(end_score)))
-        print(f"[END] task={args.task_name} score={final_score:.2f} steps={steps}", flush=True)
+        # Final summary removed to avoid confusing validator task discovery
+        # print(f"[END] task={args.task_name} score={max(0.01, min(0.99, float(end_score))):.2f} steps={steps}", flush=True)
 
 
 if __name__ == "__main__":
