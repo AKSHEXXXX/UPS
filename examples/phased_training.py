@@ -7,7 +7,7 @@ from stable_baselines3.common.callbacks import BaseCallback
 
 from server.env import ColdChainEnv, CurriculumWrapper
 from core.config import ColdChainConfig
-from core.graders import CompositeGrader
+from graders import CompositeGrader
 
 class PhasedMetricsCallback(BaseCallback):
     def __init__(self, verbose=0):

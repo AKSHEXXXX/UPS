@@ -4,9 +4,9 @@ import gymnasium as gym
 from stable_baselines3 import PPO
 from server.env import ColdChainEnv
 from core.config import ColdChainConfig
-from core.graders.basic_grader import BasicGrader
-from core.graders.delivery_success import DeliverySuccessGrader
-from core.graders.thermal_integrity import ThermalIntegrityGrader
+from graders.basic_grader import BasicGrader
+from graders.delivery_success import DeliverySuccessGrader
+from graders.thermal_integrity import ThermalIntegrityGrader
 
 def main():
     print("\n" + "="*70)

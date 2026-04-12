@@ -24,7 +24,7 @@ except ImportError:
 
 from server.env import ColdChainEnv
 from core.config import ColdChainConfig
-from core.graders import CompositeGrader
+from graders import CompositeGrader
 
 
 @pytest.mark.skipif(not HAS_SB3, reason="stable-baselines3 not installed")

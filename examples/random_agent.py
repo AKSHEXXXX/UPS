@@ -1,6 +1,6 @@
 import numpy as np
 from server.env import ColdChainEnv
-from core.graders import CompositeGrader
+from graders import CompositeGrader
 
 
 def main():

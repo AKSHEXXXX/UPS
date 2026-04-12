@@ -12,7 +12,7 @@ tasks:
     reward_function: easy
     graders:
       - name: BasicGrader
-        entrypoint: core.graders.basic_grader:BasicGrader
+        entrypoint: graders.basic_grader:BasicGrader
 
   - id: moderate
     name: Moderate Tier
@@ -21,7 +21,7 @@ tasks:
     reward_function: moderate
     graders:
       - name: ModerateGrader
-        entrypoint: core.graders.moderate_grader:ModerateGrader
+        entrypoint: graders.moderate_grader:ModerateGrader
 
   - id: hard
     name: Hard Tier
@@ -30,7 +30,7 @@ tasks:
     reward_function: hard
     graders:
       - name: HardGrader
-        entrypoint: core.graders.hard_grader:HardGrader
+        entrypoint: graders.hard_grader:HardGrader
 
   - id: extreme
     name: Extreme Tier
@@ -39,4 +39,4 @@ tasks:
     reward_function: extreme
     graders:
       - name: HardEmergencyCaseGrader
-        entrypoint: core.graders.hard_emergency:HardEmergencyCaseGrader
+        entrypoint: graders.hard_emergency:HardEmergencyCaseGrader

@@ -15,7 +15,7 @@ from openenv.core.env_server.types import State
 from core.action_mask import compute_action_mask, flatten_action
 from core.city_graph import build_city_graph, detour_cost, nearest_cold_depot, refresh_edge_weights
 from core.config import ColdChainConfig
-from core.graders import (
+from graders import (
     BasicGrader,
     CompositeGrader,
     DeliverySuccessGrader,

@@ -12,7 +12,7 @@ from core.reward import (
     progress_shaping_reward,
     temp_shaping_reward,
 )
-from core.graders import CompositeGrader
+from graders import CompositeGrader
 
 
 class TestRewardFunctions:

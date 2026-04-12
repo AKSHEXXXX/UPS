@@ -8,7 +8,7 @@ from gymnasium.utils.env_checker import check_env
 
 from core.config import ColdChainConfig
 from server.env import ColdChainEnv
-from core.graders import (
+from graders import (
     CompositeGrader,
     DeliverySuccessGrader,
     EfficiencyGrader,

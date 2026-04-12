@@ -11,7 +11,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from sb3_contrib import MaskablePPO
 
-from core.graders.new_levels import run_full_evaluation
+from graders.new_levels import run_full_evaluation
 
 
 def _load_model(model_path: str) -> MaskablePPO | None:

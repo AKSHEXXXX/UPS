@@ -9,7 +9,7 @@ import numpy as np
 
 from core.config import ColdChainConfig
 from server.env import ColdChainEnv
-from core.graders import BasicGrader
+from graders import BasicGrader
 from core.vehicle import VehicleStatus
 from examples.phase2_stabilization import CFG as BASE_CFG
 

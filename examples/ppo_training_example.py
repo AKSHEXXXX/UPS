@@ -45,7 +45,7 @@ except ImportError:
 # ColdChain-Gym imports
 from server.env import ColdChainEnv
 from core.config import ColdChainConfig
-from core.graders import CompositeGrader
+from graders import CompositeGrader
 
 
 def _flat_to_action(flat_index, config):

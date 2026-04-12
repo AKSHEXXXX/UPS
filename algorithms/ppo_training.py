@@ -24,7 +24,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from server.env import ColdChainEnv, CurriculumWrapper
 from core.config import ColdChainConfig
 from evaluation.eval_contract import build_eval_env, run_eval_episode
-from core.graders import CompositeGrader, DeliverySuccessGrader, run_full_evaluation
+from graders import CompositeGrader, DeliverySuccessGrader, run_full_evaluation
 
 
 def _ensure_gym_version_for_sb3() -> None:

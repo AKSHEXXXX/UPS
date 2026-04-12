@@ -9,8 +9,8 @@ import numpy as np
 
 from core.config import ColdChainConfig
 from server.env import ColdChainEnv
-from core.graders import HardGrader
-from core.graders import HardEmergencyCaseGrader
+from graders import HardGrader
+from graders import HardEmergencyCaseGrader
 from core.shipment import CARGO_SPECS
 from core.vehicle import RefrigStatus, VehicleStatus
 from examples.phase2_stabilization import CFG as BASE_CFG
